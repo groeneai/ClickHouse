@@ -11,3 +11,10 @@
 [thread]
 # https://github.com/ClickHouse/ClickHouse/issues/55629
 fun:rd_kafka_broker_set_nodename
+# https://github.com/ClickHouse/ClickHouse/issues/102393
+# Race in librdkafka queue between rd_kafka_q_yield (write, static inline)
+# and rd_kafka_q_serve (read, extern). Both functions hold rkq->rkq_lock,
+# but TSan is confused by the eventfd/condvar synchronization pattern.
+# rd_kafka_q_serve is the read-side extern symbol — suppressing the
+# rd_kafka_q_yield static inline directly does not work per the caveat above.
+fun:rd_kafka_q_serve
