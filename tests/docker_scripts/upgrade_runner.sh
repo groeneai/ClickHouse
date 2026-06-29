@@ -330,6 +330,14 @@ cp /var/log/clickhouse-server/clickhouse-server.upgrade.log /test_output/clickho
 #       - 04338_on_fly_mutation_read_overwritten_lc_source: `MODIFY COLUMN v UInt64` on String data ('x')
 #       `MutateFromLogEntryTask` is also excluded for the same reason, but only catches the first log line;
 #       the wrapping `MergeTreeBackgroundExecutor` line also needs to be excluded.
+#       The `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO` variant of the same #39174 class comes from:
+#       - 02597_column_update_tricky_expression_and_replication: `ALTER TABLE test UPDATE d = d + throwIf(1)`
+#         (mutations_sync=0) leaves an intentionally-failing background mutation that the upgraded server
+#         retries on restart before the test's later `KILL MUTATION ... LIKE '%throwIf%'` cleans it up.
+#       The narrow inner-text `Value passed to 'throwIf' function is non-zero` is filtered: it appears in all
+#       three emitted lines (the `MutatePlainMergeTreeTask:` line, its `executeStep()` line, and the
+#       `MergeTreeBackgroundExecutor` wrapper line), so one entry covers them all while a genuinely different
+#       background-mutation error still surfaces.
 # `NO_SUCH_INTERSERVER_IO_ENDPOINT` is expected during upgrades because replicated tables try to fetch parts
 # from replicas that are being restarted and whose interserver endpoints are temporarily unavailable.
 # `Unknown tokenizer: 'unicode_word'` appears because the `unicode_word` tokenizer was renamed to `asciiCJK`
@@ -428,6 +436,7 @@ rg -Fav -e "Code: 236. DB::Exception: Cancelled merging parts" \
            -e "Unknown index: idx." \
            -e "Cannot parse string 'Hello' as UInt64" \
            -e "Cannot parse string 'x' as UInt64" \
+           -e "Value passed to 'throwIf' function is non-zero" \
            -e "Cannot parse string 'Hello' as UInt32" \
            -e "Cannot parse string \'Hello\' as UInt32" \
            -e "Cannot parse string \\'Hello\\' as UInt32" \
