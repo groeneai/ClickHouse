@@ -37,6 +37,7 @@
 #include <Storages/MergeTree/Compaction/ConstructFuturePart.h>
 #include <Storages/MergeTree/Compaction/MergePredicates/MergeTreeMergePredicate.h>
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
+#include <Storages/MergeTree/Compaction/PartProperties.h>
 #include <Storages/MergeTree/Compaction/PartsCollectors/MergeTreePartsCollector.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeList.h>
@@ -3375,6 +3376,31 @@ std::unique_ptr<PlainCommittingBlockHolder> StorageMergeTree::injectCommittingBl
     return block_holder;
 }
 
+String StorageMergeTree::canMergePartsForTest(const String & left_name, const String & right_name, const std::function<void()> & between)
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
+    auto storage_policy = getStoragePolicy();
+
+    auto left_part = getActiveContainingPart(left_name);
+    auto right_part = getActiveContainingPart(right_name);
+    if (!left_part || !right_part)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Test parts {} / {} are not both active", left_name, right_name);
+
+    auto left = buildPartProperties(left_part, metadata_snapshot, storage_policy, /*current_time=*/0);
+    auto right = buildPartProperties(right_part, metadata_snapshot, storage_policy, /*current_time=*/0);
+
+    std::unique_lock lock(currently_processing_in_background_mutex);
+    /// Build the predicate first, exactly like the selector does, ...
+    MergeTreeMergePredicate predicate(*this, lock);
+    /// ... then let a gap-filling op commit its block (the real race orders these the same way), ...
+    if (between)
+        between();
+    /// ... and only now run the merge check. A live committing-blocks read sees the new block; a
+    /// snapshot cached in the constructor (the bug) would not.
+    auto result = predicate.canMergeParts(left, right);
+    return result ? String{} : result.error().text;
+}
+
 void StorageMergeTree::waitForCommittingInsertsAndMutations(Int64 max_block_number, size_t timeout_ms) const
 {
     auto all_committed = [&]
@@ -3402,5 +3428,11 @@ CommittingBlocksSet StorageMergeTree::getCommittingBlocks() const
 {
     std::lock_guard lock(committing_blocks_mutex);
     return committing_blocks;
+}
+
+bool StorageMergeTree::hasCommittingBlockInGap(const String & partition_id, Int64 left_max_block, Int64 right_min_block) const
+{
+    std::lock_guard lock(committing_blocks_mutex);
+    return DB::hasCommittingBlockInGap(committing_blocks, partition_id, left_max_block, right_min_block);
 }
 }

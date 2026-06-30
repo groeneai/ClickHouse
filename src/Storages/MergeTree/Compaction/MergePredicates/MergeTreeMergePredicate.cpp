@@ -22,8 +22,7 @@ static std::vector<MergeTreePartInfo> getPatchPartInfos(const StorageMergeTree &
 MergeTreeMergePredicate::MergeTreeMergePredicate(const StorageMergeTree & storage_, std::unique_lock<std::mutex> & merge_mutate_lock_)
     : storage(storage_)
     , merge_mutate_lock(merge_mutate_lock_)
-    , committing_blocks(storage.getCommittingBlocks())
-    , min_update_block(getMinUpdateBlockNumber(committing_blocks))
+    , min_update_block(getMinUpdateBlockNumber(storage.getCommittingBlocks()))
 {
     auto patches_vector = getPatchPartInfos(storage);
     patches_by_partition = getPatchPartsByPartition(patches_vector, min_update_block.value_or(std::numeric_limits<Int64>::max()));
@@ -67,7 +66,14 @@ std::expected<void, PreformattedMessage> MergeTreeMergePredicate::canMergeParts(
     /// Refuse to merge across a gap that a concurrently committing block will fill: it becomes an
     /// Active part inside the merge output range, which would then intersect it. Mirrors the
     /// committing_blocks gap check in DistributedMergePredicate.
-    if (hasCommittingBlockInGap(committing_blocks, left.info.getPartitionId(), left.info.max_block, right.info.min_block))
+    ///
+    /// Read the committing set live (not a snapshot cached in the constructor): the predicate is
+    /// built before the active-parts collector runs, so a gap-filling op (MOVE/REPLACE/ATTACH/INSERT)
+    /// can allocate its block after construction yet leave the part PreActive and invisible to the
+    /// collector. A live read here, after the collector took its parts snapshot, is consistent with
+    /// it - the block stays in committing_blocks until the part is Active under the same data parts
+    /// lock, and block numbers are monotonic, so any gap-filler missed by the snapshot is still here.
+    if (storage.hasCommittingBlockInGap(left.info.getPartitionId(), left.info.max_block, right.info.min_block))
         return std::unexpected(PreformattedMessage::create(
                 "There is a committing block in a gap between two active parts ({}, {})", left.name, right.name));
 

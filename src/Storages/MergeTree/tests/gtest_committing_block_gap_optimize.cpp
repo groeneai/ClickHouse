@@ -215,3 +215,47 @@ TEST(CommittingBlockGapOptimize, OptimizeFinalDoesNotMergeAcrossCommittingNewPar
 
     runQuery("DROP TABLE default." + table + " SYNC", context);
 }
+
+/// Focused ordering regression for the stale-snapshot race: the gap-filling block must be detected
+/// even when it starts committing AFTER the merge predicate is constructed. The predicate is built
+/// before the active-parts collector runs, so a MOVE/REPLACE/INSERT can allocate its block in that
+/// window and leave the part PreActive (invisible to the collector). canMergePartsForTest reproduces
+/// exactly that interleaving: construct the predicate, then inject the committing block, then check.
+/// A construction-time snapshot would miss the block here; a live read catches it.
+TEST(CommittingBlockGapOptimize, GapBlockCommittingAfterPredicateConstructionIsStillDetected)
+{
+    auto context = setUpContext();
+
+    const std::string table = "committing_gap_ordering";
+    runQuery("DROP TABLE IF EXISTS default." + table + " SYNC", context);
+    runQuery(
+        "CREATE TABLE default." + table
+            + " (x UInt64) ENGINE = MergeTree ORDER BY tuple() SETTINGS old_parts_lifetime = 0",
+        context);
+
+    runQuery("SYSTEM STOP MERGES default." + table, context);
+    runQuery("INSERT INTO default." + table + " VALUES (1)", context);
+    runQuery("INSERT INTO default." + table + " VALUES (2)", context);
+    runQuery("INSERT INTO default." + table + " VALUES (3)", context);
+    runQuery("ALTER TABLE default." + table + " DROP PART 'all_2_2_0'", context);
+    runQuery("SYSTEM START MERGES default." + table, context);
+
+    auto & storage = getStorageMergeTree(table, context);
+
+    /// Baseline: with no committing block in the gap, the two parts around the hole are mergeable.
+    std::unique_ptr<PlainCommittingBlockHolder> committing_gap;
+    const String no_gap = storage.canMergePartsForTest("all_1_1_0", "all_3_3_0", /*between=*/{});
+    EXPECT_EQ(no_gap, "") << "Parts should be mergeable when nothing is committing in the gap, but got: " << no_gap;
+
+    /// Now inject the gap block AFTER the predicate is constructed (the racy ordering). The merge
+    /// must still be refused, which only holds if the gap check reads the committing set live.
+    const String with_gap = storage.canMergePartsForTest(
+        "all_1_1_0",
+        "all_3_3_0",
+        [&] { committing_gap = storage.injectCommittingBlockForTest(CommittingBlock(CommittingBlock::Op::NewPart, 2, "all")); });
+    EXPECT_NE(with_gap.find("committing block in a gap"), std::string::npos)
+        << "A block that starts committing after predicate construction must still block the merge, but got: " << with_gap;
+
+    committing_gap.reset();
+    runQuery("DROP TABLE default." + table + " SYNC", context);
+}

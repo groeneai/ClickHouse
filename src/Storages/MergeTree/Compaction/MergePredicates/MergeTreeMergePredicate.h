@@ -22,7 +22,6 @@ private:
     const StorageMergeTree & storage;
     std::unique_lock<std::mutex> & merge_mutate_lock;
     PatchInfosByPartition patches_by_partition;
-    CommittingBlocksSet committing_blocks;
     std::optional<Int64> min_update_block;
 };
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <Core/Names.h>
 #include <Storages/AlterCommands.h>
@@ -132,6 +133,13 @@ public:
     /// destruction; keep it alive for as long as the gap must look occupied.
     std::unique_ptr<PlainCommittingBlockHolder> injectCommittingBlockForTest(CommittingBlock block);
 
+    /// For tests: builds the same merge predicate the selector uses for two named active parts, runs
+    /// `between` between predicate construction and the merge check, then returns the canMergeParts
+    /// reason ("" if mergeable). This reproduces the real ordering: the predicate is constructed,
+    /// then a gap-filling op commits a block (the `between` callback), then the check runs. It proves
+    /// the gap check reads the committing set live instead of a stale construction-time snapshot.
+    String canMergePartsForTest(const String & left_name, const String & right_name, const std::function<void()> & between);
+
 private:
 
     /// Mutex and condvar for synchronous mutations wait
@@ -178,6 +186,12 @@ private:
     std::unique_ptr<PlainCommittingBlockHolder> allocateBlockNumber(CommittingBlock::Op op, String partition_id = {});
     void waitForCommittingInsertsAndMutations(Int64 max_block_number, size_t timeout_ms) const;
     CommittingBlocksSet getCommittingBlocks() const;
+
+    /// True if a NewPart block for the partition is still committing strictly inside the gap
+    /// (left_max_block, right_min_block). Reads the live committing_blocks set under its mutex, so
+    /// it must be called when selecting a merge (after the active-parts snapshot), not cached: a
+    /// stale snapshot taken before the gap-filling op allocated its block would miss the race.
+    bool hasCommittingBlockInGap(const String & partition_id, Int64 left_max_block, Int64 right_min_block) const;
 
     std::atomic<bool> shutdown_called {false};
     std::atomic<bool> flush_called {false};
