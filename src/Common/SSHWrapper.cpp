@@ -34,9 +34,10 @@ struct CStringDeleter
 
 bool isKeyTypeUsableInFIPSBuilds(enum ssh_keytypes_e key_type)
 {
-    /// Ed25519 is not FIPS-approved: importing it in FIPS mode in libssh will cause bad things to happen
-    return key_type == SSH_KEYTYPE_ED25519 || key_type == SSH_KEYTYPE_ED25519_CERT01
-        || key_type == SSH_KEYTYPE_SK_ED25519 || key_type == SSH_KEYTYPE_SK_ED25519_CERT01;
+    /// Ed25519 is not FIPS-approved: importing it in FIPS mode in libssh will cause bad things to happen.
+    /// Every other supported key type (RSA, ECDSA, ...) is usable, so return "not usable" only for the Ed25519 family.
+    return !(key_type == SSH_KEYTYPE_ED25519 || key_type == SSH_KEYTYPE_ED25519_CERT01
+        || key_type == SSH_KEYTYPE_SK_ED25519 || key_type == SSH_KEYTYPE_SK_ED25519_CERT01);
 }
 
 void checkIfKeyCanBeUsedInFIPSBuilds(ssh_key key)
@@ -72,7 +73,7 @@ SSHKey SSHKeyFactory::makePublicKeyFromBase64(String base64_key, String type_nam
 {
     ssh_key key = nullptr;
     auto key_type = ssh_key_type_from_name(type_name.c_str());
-    if (!isKeyTypeUsableInFIPSBuilds(key_type))
+    if (OpenSSLInitializer::instance().isFIPSEnabled() && !isKeyTypeUsableInFIPSBuilds(key_type))
         throw Exception(ErrorCodes::LIBSSH_ERROR, "Ed25519 SSH keys are not supported in FIPS mode");
     if (int rc = ssh_pki_import_pubkey_base64(base64_key.c_str(), key_type, &key); rc != SSH_OK)
         throw Exception(ErrorCodes::LIBSSH_ERROR, "Bad SSH public key provided");

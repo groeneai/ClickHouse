@@ -48,6 +48,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int OPENSSL_ERROR;
+    extern const int LIBSSH_ERROR;
 }
 
 
@@ -519,6 +520,12 @@ AuthenticationData AuthenticationData::fromAST(const ASTAuthenticationData & que
 
             if (OpenSSLInitializer::instance().isFIPSEnabled() && !SSHKeyFactory::isPublicKeyUsableInFIPSBuilds(type))
             {
+                /// On the interactive SQL path (CREATE/ALTER USER, validate == true) fail loudly: silently dropping
+                /// the key would create a user that can never authenticate and lose the key from SHOW CREATE USER.
+                /// Only reload/ATTACH USER (validate == false) may skip and continue.
+                if (validate)
+                    throw Exception(ErrorCodes::LIBSSH_ERROR, "SSH key of type {} is not usable in FIPS mode", type);
+
                 LOG_WARNING(getLogger("AuthenticationData"), "Skipping SSH key of type {}: not usable in FIPS mode", type);
                 continue;
             }
