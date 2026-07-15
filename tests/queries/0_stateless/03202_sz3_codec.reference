@@ -58,3 +58,10 @@ Legacy error-bound-mode aliases (ABS_OR_REL, NORM) stay loadable for backward co
 A compression block size that is not a multiple of the float width is rejected
 The lossless (zstd) fallback round-trips
 1
+Non-finite values (NaN, +/-Inf) round-trip exactly
+0	0	1
+0	0	1
+0	0	1
+0	0	1
+0	0	1
+1	1	1

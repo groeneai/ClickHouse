@@ -521,3 +521,15 @@ CREATE TABLE tab_lossless (x Float64 CODEC(SZ3('ALGO_INTERP', 'ABS', 0.0001))) E
 INSERT INTO tab_lossless VALUES (1.5);
 SELECT abs(x - 1.5) <= 0.0001 FROM tab_lossless;
 DROP TABLE tab_lossless;
+
+SELECT 'Non-finite values (NaN, +/-Inf) round-trip exactly';
+-- The quantizer cannot represent a NaN or infinite value as an integer index, so it stores such values
+-- losslessly (in the unpredictable set). Casting the scaled magnitude to an integer index is undefined
+-- behaviour for NaN/Inf/overflow, so the quantizer now checks the finite range before the cast. These
+-- non-finite values must survive the lossy codec unchanged for both Float64 and Float32.
+DROP TABLE IF EXISTS tab_nonfinite;
+CREATE TABLE tab_nonfinite (x Float64 CODEC(SZ3), y Float32 CODEC(SZ3)) ENGINE = MergeTree ORDER BY tuple()
+    SETTINGS min_bytes_for_wide_part = 0;
+INSERT INTO tab_nonfinite VALUES (nan, nan) (inf, inf) (-inf, -inf) (0, 0) (1.25, 1.25) (-3.5, -3.5);
+SELECT isNaN(x), isNaN(y), x = y OR (isNaN(x) AND isNaN(y)) FROM tab_nonfinite ORDER BY x NULLS LAST, isNaN(x);
+DROP TABLE tab_nonfinite;
