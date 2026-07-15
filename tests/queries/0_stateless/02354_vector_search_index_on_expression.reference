@@ -6,6 +6,20 @@ Value-identity expression index returns the correct top-K
 0
 1
 2
+Query operand materialize(vec) uses the index
+Skip
+Name: idx
+Description: vector_similarity GRANULARITY 100000000
+Query operand materialize(vec) returns the correct top-K
+0
+1
+2
+Non-value-preserving query operand does NOT use the index
+0
+Non-value-preserving query operand still returns the correct top-K (brute-force)
+5
+4
+3
 Non-value-preserving expression index is NOT used (would give wrong top-K)
 0
 Non-value-preserving expression index still returns the correct top-K (brute-force)

@@ -162,21 +162,27 @@ size_t tryUseVectorSearch(QueryPlan::Node * parent_node, QueryPlan::Nodes & /*no
     VectorWithMemoryTracking<Float64> reference_vector;
     String search_column;
 
+    /// Strip ALIAS and value-identity function wrappers (identity(), materialize()) to reach the base column.
+    /// The index side does the same (see getValuePreservingVectorSimilarityIndexColumn), so the query operand
+    /// and the indexed column agree: ORDER BY L2Distance(materialize(vec), ...) resolves to base column 'vec'.
+    auto resolve_search_column = [](const ActionsDAG::Node * node_ptr)
+    {
+        while (node_ptr)
+        {
+            if (node_ptr->type == ActionsDAG::ActionType::ALIAS)
+                node_ptr = node_ptr->children.at(0);
+            else if (node_ptr->type == ActionsDAG::ActionType::FUNCTION && node_ptr->children.size() == 1
+                && (node_ptr->function_base->getName() == "identity" || node_ptr->function_base->getName() == "materialize"))
+                node_ptr = node_ptr->children[0];
+            else
+                break;
+        }
+        return node_ptr;
+    };
+
     for (const auto * child : sort_column_node_children)
     {
-        if (child->type == ActionsDAG::ActionType::ALIAS) /// the analyzer
-        {
-            const auto * search_column_node = child->children.at(0);
-            if (search_column_node->type == ActionsDAG::ActionType::INPUT)
-                search_column = search_column_node->result_name;
-        }
-        else if (child->type == ActionsDAG::ActionType::INPUT) /// old analyzer
-        {
-            search_column = child->result_name;
-            if (search_column.contains('.'))
-                search_column = search_column.substr(search_column.find('.') + 1); /// admittedly fragile but hey, it's the old path ...
-        }
-        else if (child->type == ActionsDAG::ActionType::COLUMN)
+        if (child->type == ActionsDAG::ActionType::COLUMN)
         {
             /// Is it an Array(Float32), Array(Float64) or Array(BFloat16) column?
             const DataTypePtr & data_type = child->result_type;
@@ -204,6 +210,12 @@ size_t tryUseVectorSearch(QueryPlan::Node * parent_node, QueryPlan::Nodes & /*no
                 Float64 float64 = field_array_value.safeGet<Float64>();
                 reference_vector.push_back(float64);
             }
+        }
+        else if (const auto * input = resolve_search_column(child); input && input->type == ActionsDAG::ActionType::INPUT)
+        {
+            search_column = input->result_name;
+            if (search_column.contains('.')) /// old analyzer prefixes the input name with the table alias
+                search_column = search_column.substr(search_column.find('.') + 1);
         }
     }
 

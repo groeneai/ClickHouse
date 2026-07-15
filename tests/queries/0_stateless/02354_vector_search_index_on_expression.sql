@@ -25,6 +25,27 @@ WHERE explain ILIKE '%Skip%' OR explain ILIKE '%Name: idx%' OR explain ILIKE '%v
 SELECT 'Value-identity expression index returns the correct top-K';
 SELECT id FROM tab_id ORDER BY L2Distance(vec, [0.0, 0.0]) LIMIT 3 SETTINGS vector_search_with_rescoring = 0;
 
+-- The query operand may itself be wrapped in a value-identity function (e.g. materialize(vec), identity(vec)).
+-- It must be normalized to the base column so the same vector similarity index is used, not brute-forced.
+SELECT 'Query operand materialize(vec) uses the index';
+SELECT trimLeft(explain) AS explain FROM (
+    EXPLAIN indexes=1 SELECT id FROM tab_id ORDER BY L2Distance(materialize(vec), [0.0, 0.0]) LIMIT 3
+)
+WHERE explain ILIKE '%Skip%' OR explain ILIKE '%Name: idx%' OR explain ILIKE '%vector_similarity%';
+
+SELECT 'Query operand materialize(vec) returns the correct top-K';
+SELECT id FROM tab_id ORDER BY L2Distance(materialize(vec), [0.0, 0.0]) LIMIT 3 SETTINGS vector_search_with_rescoring = 0;
+
+-- A non-value-preserving query operand must NOT use the index (would search transformed space with the raw
+-- reference vector and return the wrong top-K); it falls back to a correct brute-force.
+SELECT 'Non-value-preserving query operand does NOT use the index';
+SELECT countIf(explain ILIKE '%Skip%') FROM (
+    EXPLAIN indexes=1 SELECT id FROM tab_id ORDER BY L2Distance(arrayMap(x -> 100 - x, vec), [0.0, 0.0]) LIMIT 3
+);
+
+SELECT 'Non-value-preserving query operand still returns the correct top-K (brute-force)';
+SELECT id FROM tab_id ORDER BY L2Distance(arrayMap(x -> 100 - x, vec), [0.0, 0.0]) LIMIT 3 SETTINGS vector_search_with_rescoring = 0;
+
 -- Index built over 100 - vec, but the query searches with the raw reference vector [0, 0].
 CREATE TABLE tab_bad(id Int32, vec Array(Float32), INDEX idx arrayMap(x -> 100 - x, vec) TYPE vector_similarity('hnsw', 'L2Distance', 2)) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
 INSERT INTO tab_bad VALUES (0, [0.0, 0.0]), (1, [1.0, 1.0]), (2, [2.0, 2.0]), (3, [3.0, 3.0]), (4, [10.0, 10.0]), (5, [20.0, 20.0]);
