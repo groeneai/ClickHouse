@@ -7,6 +7,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Processors/QueryPlan/DistinctStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
@@ -53,15 +54,25 @@ size_t tryUseVectorSearchWithVectorIndexFirstPass(QueryPlan::Node * parent_node,
     constexpr size_t no_layers_updated = 0;
 
     bool additional_filters_present = false; /// WHERE or PREWHERE
+    bool distinct_present = false; /// SELECT DISTINCT
 
     /// Expect this query plan:
     /// LimitStep
+    ///    ^
+    ///    |
+    /// (optional: DistinctStep)         -- SELECT DISTINCT (final)
     ///    ^
     ///    |
     /// SortingStep
     ///    ^
     ///    |
     /// ExpressionStep
+    ///    ^
+    ///    |
+    /// (optional: DistinctStep)         -- SELECT DISTINCT (preliminary)
+    ///    ^
+    ///    |
+    /// (optional: ExpressionStep)       -- present only together with the preliminary DistinctStep
     ///    ^
     ///    |
     /// (optional: FilterStep)
@@ -76,6 +87,14 @@ size_t tryUseVectorSearchWithVectorIndexFirstPass(QueryPlan::Node * parent_node,
     if (node->children.size() != 1)
         return no_layers_updated;
     node = node->children.front();
+    /// SELECT DISTINCT inserts the final DistinctStep between LimitStep and SortingStep (issue #111343).
+    if (auto * final_distinct_step = typeid_cast<DistinctStep *>(node->step.get()); final_distinct_step && !final_distinct_step->isPreliminary())
+    {
+        distinct_present = true;
+        if (node->children.size() != 1)
+            return no_layers_updated;
+        node = node->children.front();
+    }
     auto * sorting_step = typeid_cast<SortingStep *>(node->step.get());
     if (!sorting_step)
         return no_layers_updated;
@@ -83,6 +102,32 @@ size_t tryUseVectorSearchWithVectorIndexFirstPass(QueryPlan::Node * parent_node,
     if (node->children.size() != 1)
         return no_layers_updated;
     node = node->children.front();
+    /// Steps over a preliminary DistinctStep if the current node is one. Returns whether it did; sets
+    /// `stepped_ok` to false if the tree shape is unexpected (a step with multiple children).
+    bool stepped_ok = true;
+    auto step_over_preliminary_distinct = [&]() -> bool
+    {
+        if (auto * preliminary_distinct_step = typeid_cast<DistinctStep *>(node->step.get());
+            preliminary_distinct_step && preliminary_distinct_step->isPreliminary())
+        {
+            distinct_present = true;
+            if (node->children.size() != 1)
+            {
+                stepped_ok = false;
+                return false;
+            }
+            node = node->children.front();
+            return true;
+        }
+        return false;
+    };
+
+    /// The old analyzer places the preliminary DistinctStep BELOW the SortingStep and ABOVE the ORDER BY
+    /// ExpressionStep.
+    step_over_preliminary_distinct();
+    if (!stepped_ok)
+        return no_layers_updated;
+
     auto * expression_step = typeid_cast<ExpressionStep *>(node->step.get());
     if (!expression_step)
         return no_layers_updated;
@@ -90,6 +135,21 @@ size_t tryUseVectorSearchWithVectorIndexFirstPass(QueryPlan::Node * parent_node,
     if (node->children.size() != 1)
         return no_layers_updated;
     node = node->children.front();
+    /// The analyzer instead places the preliminary DistinctStep BELOW the ORDER BY ExpressionStep,
+    /// followed by a projection ExpressionStep. Step over both.
+    if (step_over_preliminary_distinct())
+    {
+        /// A projection ExpressionStep usually sits between the preliminary DistinctStep and the read.
+        /// Step over it if present; if it was merged away, we are already at the read/filter node.
+        if (typeid_cast<ExpressionStep *>(node->step.get()))
+        {
+            if (node->children.size() != 1)
+                return no_layers_updated;
+            node = node->children.front();
+        }
+    }
+    if (!stepped_ok)
+        return no_layers_updated;
     auto * read_from_mergetree_step = typeid_cast<ReadFromMergeTree *>(node->step.get());
     FilterStep * filter_step = nullptr;
     if (!read_from_mergetree_step)
@@ -244,8 +304,11 @@ size_t tryUseVectorSearchWithVectorIndexFirstPass(QueryPlan::Node * parent_node,
             "The `_distance` column is an internal virtual column of vector search and cannot be referenced directly in queries. "
             "Use the distance function (e.g. `L2Distance`, `cosineDistance`) in ORDER BY instead");
 
+    /// DISTINCT, like a filter, can remove rows after the read (see VectorSearchParameters::post_read_row_reduction).
+    const bool post_read_row_reduction = additional_filters_present || distinct_present;
+
     /// All set for 2nd pass
-    auto vector_search_parameters = std::make_optional<VectorSearchParameters>(search_column, distance_function, n, reference_vector, additional_filters_present, true);
+    auto vector_search_parameters = std::make_optional<VectorSearchParameters>(search_column, distance_function, n, reference_vector, post_read_row_reduction, true);
     read_from_mergetree_step->setVectorSearchParameters(std::move(vector_search_parameters));
 
     return no_layers_updated;
@@ -259,10 +322,19 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
     /// LimitStep
     ///    ^
     ///    |
+    /// (optional: DistinctStep)         -- SELECT DISTINCT (final)
+    ///    ^
+    ///    |
     /// SortingStep
     ///    ^
     ///    |
     /// ExpressionStep
+    ///    ^
+    ///    |
+    /// (optional: DistinctStep)         -- SELECT DISTINCT (preliminary)
+    ///    ^
+    ///    |
+    /// (optional: ExpressionStep)       -- present only together with the preliminary DistinctStep
     ///    ^
     ///    |
     /// (FilterStep, optional) Or (ExpressionStep, if prewhere optimization)
@@ -284,6 +356,13 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
     if (node->children.size() != 1)
         return false;
     node = node->children.front();
+    /// SELECT DISTINCT inserts the final DistinctStep between LimitStep and SortingStep (issue #111343).
+    if (auto * final_distinct_step = typeid_cast<DistinctStep *>(node->step.get()); final_distinct_step && !final_distinct_step->isPreliminary())
+    {
+        if (node->children.size() != 1)
+            return false;
+        node = node->children.front();
+    }
     auto * sorting_step = typeid_cast<SortingStep *>(node->step.get());
     if (!sorting_step)
         return false;
@@ -291,6 +370,38 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
     if (node->children.size() != 1)
         return false;
     node = node->children.front();
+
+    /// Steps over a preliminary DistinctStep if the current node is one. Returns whether it did; sets
+    /// `stepped_ok` to false if the tree shape is unexpected (a step with multiple children). The stepped-over
+    /// node, if any, is appended to `collected` so its header can be refreshed after the `_distance` substitution.
+    bool stepped_ok = true;
+    std::vector<QueryPlan::Node *> distinct_nodes_below_expression; /// analyzer: between ORDER BY ExpressionStep and read
+    auto step_over_preliminary_distinct = [&](std::vector<QueryPlan::Node *> & collected) -> bool
+    {
+        if (auto * preliminary_distinct_step = typeid_cast<DistinctStep *>(node->step.get());
+            preliminary_distinct_step && preliminary_distinct_step->isPreliminary())
+        {
+            if (node->children.size() != 1)
+            {
+                stepped_ok = false;
+                return false;
+            }
+            collected.push_back(node);
+            node = node->children.front();
+            return true;
+        }
+        return false;
+    };
+
+    /// The old analyzer places the preliminary DistinctStep BELOW the SortingStep and ABOVE the ORDER BY
+    /// ExpressionStep. There, the ORDER BY ExpressionStep's output header is preserved by the substitution
+    /// (it still exposes the DISTINCT columns + the ORDER BY alias), so the DistinctStep above it needs no
+    /// header refresh - it is only stepped over.
+    std::vector<QueryPlan::Node *> distinct_nodes_above_expression;
+    step_over_preliminary_distinct(distinct_nodes_above_expression);
+    if (!stepped_ok)
+        return false;
+
     auto * expression_step = typeid_cast<ExpressionStep *>(node->step.get());
     if (!expression_step)
         return false;
@@ -300,6 +411,24 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
 
     auto * expression_node = node;
     node = node->children.front();
+
+    /// The analyzer instead places the preliminary DistinctStep BELOW the ORDER BY ExpressionStep, optionally
+    /// followed by a projection ExpressionStep. These feed the ORDER BY ExpressionStep, so when `vec` is removed
+    /// from the read their headers must be refreshed bottom-up to cascade `_distance` upwards.
+    if (step_over_preliminary_distinct(distinct_nodes_below_expression))
+    {
+        /// A projection ExpressionStep usually sits between the preliminary DistinctStep and the read.
+        /// Step over it if present; if it was merged away, we are already at the read/filter node.
+        if (typeid_cast<ExpressionStep *>(node->step.get()))
+        {
+            if (node->children.size() != 1)
+                return false;
+            distinct_nodes_below_expression.push_back(node);
+            node = node->children.front();
+        }
+    }
+    if (!stepped_ok)
+        return false;
 
     auto * read_from_mergetree_step = typeid_cast<ReadFromMergeTree *>(node->step.get());
 
@@ -408,6 +537,64 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
             }
         }
 
+        /// Skip the substitution if `vec` feeds a surviving computed column (e.g. SELECT DISTINCT arraySum(vec)):
+        /// the substitution removes `vec` from the read, so it is safe only when `vec` is consumed solely by the
+        /// ORDER BY distance. A consumer can live in an interposed projection (unmerged) or the ORDER BY step (merged).
+        if (optimize_plan)
+        {
+            /// True for the search-column INPUT or a plain ALIAS-chain rename of it (both removed together with `vec`).
+            const auto is_search_column = [&](const ActionsDAG::Node * n)
+            {
+                while (n->type == ActionsDAG::ActionType::ALIAS)
+                    n = n->children.at(0);
+                if (n->type != ActionsDAG::ActionType::INPUT)
+                    return false;
+                return n->result_name == search_column
+                    || (n->result_name.contains('.') && n->result_name.ends_with("." + search_column));
+            };
+            /// True if any node reads the vector column while not being a bare passthrough/rename of it.
+            const auto consumes_search_column = [&](const ActionsDAG & dag)
+            {
+                for (const ActionsDAG::Node & dag_node : dag.getNodes())
+                {
+                    if (is_search_column(&dag_node))
+                        continue;
+                    for (const ActionsDAG::Node * child : dag_node.children)
+                        if (is_search_column(child))
+                            return true;
+                }
+                return false;
+            };
+
+            for (const QueryPlan::Node * distinct_node : distinct_nodes_below_expression)
+            {
+                if (const auto * projection_step = typeid_cast<const ExpressionStep *>(distinct_node->step.get());
+                    projection_step && consumes_search_column(projection_step->getExpression()))
+                {
+                    optimize_plan = false;
+                    break;
+                }
+            }
+
+            /// In the merged plan the computed column lives in the ORDER BY step; only the sort column may read `vec`.
+            if (optimize_plan)
+            {
+                for (const ActionsDAG::Node & dag_node : expression.getNodes())
+                {
+                    if (is_search_column(&dag_node) || dag_node.result_name == sort_column)
+                        continue;
+                    for (const ActionsDAG::Node * child : dag_node.children)
+                        if (is_search_column(child))
+                        {
+                            optimize_plan = false;
+                            break;
+                        }
+                    if (!optimize_plan)
+                        break;
+                }
+            }
+        }
+
         if (optimize_plan)
         {
             auto analyzed_result = read_from_mergetree_step->getAnalyzedResult();
@@ -486,11 +673,54 @@ bool optimizeVectorSearchWithVectorIndexSecondPass(QueryPlan::Node & /*root*/, S
                 new_step->setStepDescription(*filter_or_prewhere_node->step);
                filter_or_prewhere_node->step = std::move(new_step);
             }
+
+            /// Refresh the headers of the interposed nodes bottom-up so `_distance` replaces `vec` up to the ORDER BY
+            /// ExpressionStep. `distinct_nodes_below_expression` is ordered top-down [preliminary DistinctStep,
+            /// projection ExpressionStep?]; each node's single child was already rewritten and carries the new header.
+            for (auto it = distinct_nodes_below_expression.rbegin(); it != distinct_nodes_below_expression.rend(); ++it)
+            {
+                QueryPlan::Node * distinct_node = *it;
+                const SharedHeader child_output_header = distinct_node->children.front()->step->getOutputHeader();
+                if (auto * projection_step = typeid_cast<ExpressionStep *>(distinct_node->step.get()))
+                {
+                    /// Drop the projection's `vec` output (bare INPUT or ALIAS, all three forms) so `updateHeader`
+                    /// forwards `_distance` in its place (unreferenced inputs are passed through).
+                    ActionsDAG & projection_expression = projection_step->getExpression();
+                    String output_result_to_delete;
+                    for (const auto * output_node : projection_expression.getOutputs())
+                    {
+                        if (output_node->result_name == search_column
+                            || (output_node->type == ActionsDAG::ActionType::ALIAS && output_node->children.at(0)->result_name == search_column)
+                            || (output_node->result_name.contains('.') && output_node->result_name.ends_with("." + search_column)))
+                        {
+                            output_result_to_delete = output_node->result_name;
+                            break;
+                        }
+                    }
+                    if (!output_result_to_delete.empty())
+                    {
+                        projection_expression.removeUnusedResult(output_result_to_delete);
+                        projection_expression.removeUnusedActions();
+                    }
+
+                    auto new_projection_step = std::make_unique<ExpressionStep>(child_output_header, std::move(projection_expression));
+                    new_projection_step->setStepDescription(*distinct_node->step);
+                    distinct_node->step = std::move(new_projection_step);
+                }
+                else
+                {
+                    /// DistinctStep is a pure passthrough (output header == input header), so refreshing the
+                    /// input header drops `vec` and forwards `_distance`.
+                    distinct_node->step->updateInputHeader(child_output_header);
+                }
+            }
         }
 
         /// Update the node with new Step
-        auto new_step = std::make_unique<ExpressionStep>(
-            filter_or_prewhere_node ? filter_or_prewhere_node->step.get()->getOutputHeader() : read_from_mergetree_step->getOutputHeader(), std::move(expression));
+        const SharedHeader expression_input_header = !distinct_nodes_below_expression.empty()
+            ? distinct_nodes_below_expression.front()->step->getOutputHeader()
+            : (filter_or_prewhere_node ? filter_or_prewhere_node->step->getOutputHeader() : read_from_mergetree_step->getOutputHeader());
+        auto new_step = std::make_unique<ExpressionStep>(expression_input_header, std::move(expression));
         new_step->setStepDescription(*expression_node->step);
         expression_node->step = std::move(new_step);
 

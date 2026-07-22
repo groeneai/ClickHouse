@@ -1,0 +1,48 @@
+Test "SELECT DISTINCT id" without and with rescoring
+5
+6
+7
+-- Expect column "_distance" in EXPLAIN. Column "vec" is not expected for ReadFromMergeTree.
+_distance Float32
+5
+6
+7
+-- Dont expect column "_distance" in EXPLAIN.
+-- Test that rescoring evaluates the distance only for candidate rows.
+5	0
+Test DISTINCT with the old analyzer
+5
+6
+7
+-- Expect column "_distance" in EXPLAIN (the second pass substitution runs under the old analyzer too).
+_distance Float32
+Test DISTINCT in the presence of a WHERE predicate
+-- Filter selects the full part, so the optimization takes effect. Expect column "_distance" in EXPLAIN.
+_distance Float32
+5
+6
+7
+8
+9
+Test "SELECT DISTINCT id, vec" - SELECTing vec explicitly disables the optimization
+-- Dont expect column "_distance" in EXPLAIN.
+Test "SELECT DISTINCT arraySum(vec)" - a computed projection over the vector column disables the substitution
+-- Dont expect column "_distance" in EXPLAIN (the DISTINCT key still needs the vector column).
+-- The vector index is still used (only the _distance substitution is disabled, not the whole optimization).
+1
+2
+2.0999999046325684
+2.200000047683716
+Correctness: indexed DISTINCT equals brute-force DISTINCT when duplicates collapse below LIMIT
+Brute-force DISTINCT result
+1
+2
+3
+Indexed DISTINCT result without rescoring
+1
+2
+3
+Indexed DISTINCT result with rescoring
+1
+2
+3
