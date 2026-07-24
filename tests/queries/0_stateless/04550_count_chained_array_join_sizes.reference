@@ -1,0 +1,47 @@
+Correctness: chained count() must equal the optimization-off result for every ARRAY JOIN kind combination.
+1
+1
+1
+1
+1
+1
+1
+1
+1
+count()	UInt64					
+Optimization: the plan must read every arr.size0, drop the ARRAY JOIN, aggregate with sum() and never materialize a placeholder array.
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+Out-of-scope shapes in a chained query must still decline (keep the ARRAY JOIN) and stay equal to the optimization-off result.
+1
+1
+1
+1
+1
+1
+1
+1
+Correctness under empty_result_for_aggregation_by_empty_set: an all-empty chained ARRAY JOIN returns an empty result, matching the optimization-off behavior.
