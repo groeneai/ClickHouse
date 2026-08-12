@@ -149,6 +149,10 @@ public:
         static constexpr size_t max_bytes_per_empty_match
             = CancellationBudget::units_per_check / 64 * CancellationBudget::bytes_per_unit;
 
+        /// An empty match from a trivial pattern is reported at the position the search started from, so
+        /// nothing was scanned to find it. An empty match from re2 does not carry a position at all.
+        const size_t empty_match_charge = re.getRE2() ? max_bytes_per_empty_match : 0;
+
         Pos begin = reinterpret_cast<Pos>(src.data());
         Pos end = reinterpret_cast<Pos>(src.data() + src.size());
         Pos pos = begin;
@@ -169,9 +173,7 @@ public:
                 }
                 else
                 {
-                    /// `offset` is not a position for an empty match, so the distance scanned is unknown
-                    /// and may be up to `end - pos`.
-                    budget.charge(std::min<size_t>(end - pos, max_bytes_per_empty_match));
+                    budget.charge(std::min<size_t>(end - pos, empty_match_charge));
 
                     if (count_matches_stop_at_empty_match)
                     {
