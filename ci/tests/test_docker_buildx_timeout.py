@@ -166,10 +166,32 @@ def test_both_call_sites_pass_the_retries_and_the_retry_errors():
     Both kwargs are named: `retries=` alone leaves an expiry unmatched, and
     `retry_errors=` alone is silently coerced to two attempts but stops matching
     the sentinels if the list is emptied.
+
+    The whole expression, not a prefix: `BUILDX_RETRIES + 1` and
+    `BUILDX_RETRY_ERRORS[:-2]` both start with the constant's name, yet the first
+    buys an extra attempt the envelope never priced and the second silently drops
+    both expiry sentinels.
     """
     src = open(docker_server.__file__, encoding="utf-8").read()
-    assert src.count("retries=BUILDX_RETRIES") == 2
-    assert src.count("retry_errors=BUILDX_RETRY_ERRORS") == 2
+    calls = [
+        node
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "from_commands_run"
+        and any(kw.arg == "retries" for kw in node.keywords)
+    ]
+    assert len(calls) == 2, f"expected the two wrapped buildx calls, found {len(calls)}"
+    for call in calls:
+        passed = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        assert passed.get("retries") == "BUILDX_RETRIES", (
+            f"retries={passed.get('retries')} is not the bare constant, so the "
+            "attempt count the envelope prices is not the one in effect"
+        )
+        assert passed.get("retry_errors") == "BUILDX_RETRY_ERRORS", (
+            f"retry_errors={passed.get('retry_errors')} is not the bare list, so an "
+            "expiry sentinel can be dropped while this still looks wired"
+        )
 
 
 # --- the aggregate budget ---------------------------------------------------
@@ -282,9 +304,14 @@ def test_the_build_loops_worst_case_fits_inside_the_jobs_own_cap():
 
 
 # Two samples, and the bound is the larger. End to end, from the loop's last build to
-# process exit, so the commands reporting no result of their own are inside it: 60 whole
-# jobs, max 120.5s, p50 67.5s. Summing only the result rows, which misses those commands
-# by 0.4-18.1s: 296 whole jobs, max 133s, p50 40.3s, p99 70.7s.
+# process exit, so the commands reporting no result of their own are inside it: 60
+# succeeding jobs, max 120.5s (PR 101135, 00b919cbb3b87ff625d5e4ed0fbf26b8f3a34307),
+# p50 67.5s. Summing only the result rows, which misses those commands by 0.4-18.1s:
+# 296 jobs, max 133s, p50 40.3s, p99 70.7s. Reproduce either from
+# result_docker_{server,keeper}_image.json under
+# s3.amazonaws.com/clickhouse-test-reports/PRs/<pr>/<sha>/, whose results carry absolute
+# start_time and duration; a failing tail is not in the sample, so treat this as the cost
+# of the phases completing, not of them erroring.
 UNBOUNDED_TAIL_OBSERVED_SECONDS = 133
 
 
@@ -522,24 +549,39 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
             "a constant or a fresh object detaches the bound from the real job"
         )
 
-    # Passing the live name is not enough: what that name was bound to is the cap.
-    # Every assignment to it must read a JobConfigs timeout, or the helper divides a
-    # constant that the keyword check above cannot see.
-    binds = [
+    # Passing the live name is not enough: the cap is whatever that name was bound to,
+    # and any other job's timeout reads as well-formed here while being the wrong
+    # number. Pin the two exact sources, so a substituted config is a failure and a
+    # renamed one is a deliberate edit.
+    binds = {
+        ast.unparse(node.value)
+        for node in ast.walk(mains[0])
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "job_timeout" for t in node.targets)
+    }
+    assert binds == {
+        "JobConfigs.docker_server.timeout",
+        "JobConfigs.docker_keeper.timeout",
+    }, (
+        f"main() binds job_timeout from {sorted(binds)}, not from the two docker job "
+        "configs; another job's timeout is a different cap than the one that kills us"
+    )
+
+    # One stopwatch for the whole job, created before the loop: a rebind inside it
+    # would restart elapsed time, so each group would divide the cap afresh.
+    sw_binds = [
         node
         for node in ast.walk(mains[0])
         if isinstance(node, ast.Assign)
-        and any(
-            isinstance(t, ast.Name) and t.id == "job_timeout" for t in node.targets
-        )
+        and any(isinstance(t, ast.Name) and t.id == "sw" for t in node.targets)
     ]
-    assert binds, "main() no longer binds job_timeout"
-    for bind in binds:
-        source = ast.unparse(bind.value)
-        assert re.fullmatch(r"JobConfigs\.\w+\.timeout", source), (
-            f"main() binds job_timeout to [{source}], not a JobConfigs timeout; "
-            "the helper then has no cap to divide and each build runs unshrunk"
-        )
+    assert len(sw_binds) == 1, (
+        f"main() binds sw {len(sw_binds)} times; a rebind resets elapsed time and "
+        "every group then gets the budget of a fresh job"
+    )
+    assert sw_binds[0].lineno < calls[0].lineno, (
+        "main() binds sw after the build call, so elapsed time starts inside the loop"
+    )
 
 
 def test_the_build_helper_cannot_be_called_without_its_budget_context():
