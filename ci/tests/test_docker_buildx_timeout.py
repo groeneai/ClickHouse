@@ -567,8 +567,10 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
         "configs; another job's timeout is a different cap than the one that kills us"
     )
 
-    # One stopwatch for the whole job, created before the loop: a rebind inside it
-    # would restart elapsed time, so each group would divide the cap afresh.
+    # One stopwatch for the whole job, at main()'s own top level. Line order is not
+    # enough: moving the sole assignment just inside `for os_` still precedes the call
+    # textually while restarting elapsed time, so each group would divide the cap
+    # afresh. Scope is the property, so require it to be a direct statement of main().
     sw_binds = [
         node
         for node in ast.walk(mains[0])
@@ -579,8 +581,9 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
         f"main() binds sw {len(sw_binds)} times; a rebind resets elapsed time and "
         "every group then gets the budget of a fresh job"
     )
-    assert sw_binds[0].lineno < calls[0].lineno, (
-        "main() binds sw after the build call, so elapsed time starts inside the loop"
+    assert sw_binds[0] in mains[0].body, (
+        "main() binds sw inside a nested block, so elapsed time restarts per group "
+        "instead of measuring the whole job"
     )
 
 
