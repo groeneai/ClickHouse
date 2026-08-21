@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 # `ci/defs/job_configs.py` does `from praktika import ...` rather than
 # `from ci.praktika import ...`, so `ci/` itself must be on the path too.
@@ -279,9 +281,10 @@ def test_the_build_loops_worst_case_fits_inside_the_jobs_own_cap():
             )
 
 
-# Slowest tail observed over 296 whole jobs in 90 days (p50 40.3s, p99 70.7s). Measured
-# end to end, from the loop's last build to process exit, so the commands that report no
-# result of their own are inside it too.
+# Two samples, and the bound is the larger. End to end, from the loop's last build to
+# process exit, so the commands reporting no result of their own are inside it: 60 whole
+# jobs, max 120.5s, p50 67.5s. Summing only the result rows, which misses those commands
+# by 0.4-18.1s: 296 whole jobs, max 133s, p50 40.3s, p99 70.7s.
 UNBOUNDED_TAIL_OBSERVED_SECONDS = 133
 
 
@@ -364,6 +367,19 @@ def test_an_exhausted_budget_never_yields_an_unbounded_timeout():
     # and the floor really does expire, unlike 0
     got = _run(with_timeout("sleep 30", BUILDX_TIMEOUT_FLOOR // 60))
     assert got.returncode == 124
+
+
+def test_a_missing_job_cap_is_refused_rather_than_run_unbounded():
+    """No cap must not degrade to the unshrunk bound.
+
+    Every production call site passes a real cap, so a falsy one means the wiring
+    broke; dividing nothing and handing each invocation the fixed bound instead
+    models 50058s against an 18000s job, which is the wedge in a different costume.
+    Both main() assignments could be zeroed with every other arm still green.
+    """
+    for absent in (0, -1):
+        with pytest.raises(AssertionError):
+            buildx_timeout(0.0, absent)
 
 
 class _Elapsed:
@@ -501,6 +517,25 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
         assert isinstance(value, ast.Name) and value.id == name, (
             f"main() passes {name}={ast.dump(value)}, not the live {name} binding; "
             "a constant or a fresh object silently restores the fixed bound"
+        )
+
+    # Passing the live name is not enough: what that name was bound to is the cap.
+    # Every assignment to it must read a JobConfigs timeout, or the helper divides a
+    # constant that the keyword check above cannot see.
+    binds = [
+        node
+        for node in ast.walk(mains[0])
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "job_timeout" for t in node.targets
+        )
+    ]
+    assert binds, "main() no longer binds job_timeout"
+    for bind in binds:
+        source = ast.unparse(bind.value)
+        assert re.fullmatch(r"JobConfigs\.\w+\.timeout", source), (
+            f"main() binds job_timeout to [{source}], not a JobConfigs timeout; "
+            "the helper then has no cap to divide and each build runs unshrunk"
         )
 
 

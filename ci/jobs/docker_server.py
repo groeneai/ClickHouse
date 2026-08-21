@@ -283,10 +283,11 @@ BUILDX_JOB_RESERVE = 3600
 BUILDX_TIMEOUT_FLOOR = 60
 
 
-def buildx_timeout(elapsed: float = 0.0, job_timeout: int = 0) -> int:
+def buildx_timeout(elapsed: float, job_timeout: int) -> int:
     """Per-invocation bound, shrunk so the build loop stays inside the job's own cap."""
-    if not job_timeout:
-        return BUILDX_TIMEOUT
+    # Refuse rather than fall back to the unshrunk bound: without a cap to divide, nine
+    # invocations of it model 50058s against an 18000s job.
+    assert job_timeout > 0, f"a positive job cap is required, got [{job_timeout}]"
     # One invocation may retry, so it costs up to BUILDX_RETRIES * (bound + kill-after).
     attempts = max(BUILDX_RETRIES, 2)
     budget = (job_timeout - BUILDX_JOB_RESERVE - elapsed) / attempts
