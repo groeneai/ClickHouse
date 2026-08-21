@@ -483,11 +483,14 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
     """The shrinking deadline is inert unless main() supplies its two inputs.
 
     The arm above supplies them itself, so it pins the two inner call sites but
-    cannot see main(), the only production caller. Measured: dropping them from
-    main() leaves the whole suite green while the scheduled shape goes from
-    16334s to 50058s against an 18000s cap. AST rather than a substring count,
-    because a count cannot tell a keyword from a comment mentioning one, and the
-    keyword names alone cannot tell the live bindings from a falsy constant.
+    cannot see main(), the only production caller. AST rather than a substring
+    count, because a count cannot tell a keyword from a comment mentioning one,
+    and the keyword names alone cannot tell a live binding from a constant.
+
+    A zero cap is refused outright now, so this arm's job is the cases that
+    refusal cannot reach: a cap that is well-formed but not the job's own. Both
+    halves are load-bearing, since the value a name is bound to is invisible at
+    the call site.
     """
     src = open(docker_server.__file__, encoding="utf-8").read()
     mains = [
@@ -504,8 +507,8 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
         and node.func.id == "build_and_push_image"
     ]
     assert len(calls) == 1, "main() no longer has exactly one build call"
-    # The value, not just the keyword: a literal `job_timeout=0` is falsy, so
-    # buildx_timeout returns the fixed bound while the keyword is still spelled.
+    # The value, not just the keyword: a keyword can be spelled while carrying
+    # something other than the binding main() computed.
     passed = {
         kw.arg: kw.value for kw in calls[0].keywords if kw.arg in ("sw", "job_timeout")
     }
@@ -516,7 +519,7 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
         )
         assert isinstance(value, ast.Name) and value.id == name, (
             f"main() passes {name}={ast.dump(value)}, not the live {name} binding; "
-            "a constant or a fresh object silently restores the fixed bound"
+            "a constant or a fresh object detaches the bound from the real job"
         )
 
     # Passing the live name is not enough: what that name was bound to is the cap.
@@ -540,11 +543,11 @@ def test_main_passes_the_stopwatch_and_the_job_cap_to_every_build():
 
 
 def test_the_build_helper_cannot_be_called_without_its_budget_context():
-    """A default for either parameter silently restores the fixed bound."""
+    """A default for either parameter would hide a caller that never passed one."""
     params = inspect.signature(docker_server.build_and_push_image).parameters
     for name in ("sw", "job_timeout"):
         assert params[name].default is inspect.Parameter.empty, (
-            f"{name} has a default, so omitting it silently selects a fixed bound"
+            f"{name} has a default, so a caller can omit it and never be caught"
         )
 
 

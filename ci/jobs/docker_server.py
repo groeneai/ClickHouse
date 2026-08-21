@@ -354,7 +354,7 @@ def build_and_push_image(
     run_url: str,
     sha: str,
     apt_mirror_region: str,
-    # Required: a default here silently selects the fixed bound.
+    # Required: a default here would hide a caller that never plumbed the budget.
     sw: Utils.Stopwatch,
     job_timeout: int,
 ) -> List[Result]:
