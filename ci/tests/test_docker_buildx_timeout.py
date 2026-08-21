@@ -279,8 +279,9 @@ def test_the_build_loops_worst_case_fits_inside_the_jobs_own_cap():
             )
 
 
-# Slowest complete tail over 296 whole jobs in 90 days of CIDB (p50 40.3s, p99 70.7s):
-# every `docker library image test` row plus `Check README`, summed per job.
+# Slowest tail observed over 296 whole jobs in 90 days (p50 40.3s, p99 70.7s). Measured
+# end to end, from the loop's last build to process exit, so the commands that report no
+# result of their own are inside it too.
 UNBOUNDED_TAIL_OBSERVED_SECONDS = 133
 
 
