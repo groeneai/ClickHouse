@@ -274,9 +274,9 @@ BUILDX_TIMEOUT_KILL_DIAG = "sending signal KILL to command"
 # Both sentinels must go to stderr: Shell.run matches retry_errors against stderr only.
 BUILDX_RETRY_ERRORS += [BUILDX_TIMEOUT_MESSAGE, BUILDX_TIMEOUT_KILL_DIAG]
 BUILDX_TIMEOUT_KILL_AFTER = 120
-# A per-invocation bound does not bound the job: main() loops over os variants and tags,
-# so the invocation count is not fixed. Keep back this much of the cap for recording a
-# result, and give each invocation whatever is left.
+# A per-invocation bound does not bound the loop: main() loops over os variants and tags,
+# so the invocation count is not fixed. Each deadline is what remains of the cap past this
+# reserve, which is also all that test_docker_library and check_server_readme ever get.
 BUILDX_JOB_RESERVE = 3600
 # `timeout 0` runs unbounded (measured: rc 0 after the full command), so a deadline that
 # has passed must never reach `timeout` as 0. Clamp to a floor that still expires.
@@ -284,7 +284,7 @@ BUILDX_TIMEOUT_FLOOR = 60
 
 
 def buildx_timeout(elapsed: float = 0.0, job_timeout: int = 0) -> int:
-    """Per-invocation bound, shrunk so the whole job stays inside its own cap."""
+    """Per-invocation bound, shrunk so the build loop stays inside the job's own cap."""
     if not job_timeout:
         return BUILDX_TIMEOUT
     # One invocation may retry, so it costs up to BUILDX_RETRIES * (bound + kill-after).

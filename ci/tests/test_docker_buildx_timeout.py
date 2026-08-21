@@ -248,10 +248,14 @@ def _worst_case_job_seconds(n_variants, n_tags, push, cap):
     return max(reachable)
 
 
-def test_the_whole_job_worst_case_fits_inside_the_jobs_own_cap():
-    """The claim the whole change rests on, asserted against the real cap.
+def test_the_build_loops_worst_case_fits_inside_the_jobs_own_cap():
+    """The claim the bound rests on, asserted against the real cap.
 
-    A per-invocation bound does not bound the job: main() loops over os variants
+    Scoped to main()'s build loop. The phases after the loop take no deadline and
+    are not modelled here; what covers them is the slack this arm leaves, which
+    test_the_reserve_still_covers_the_unbounded_phases pins separately.
+
+    A per-invocation bound does not bound the loop: main() loops over os variants
     and tags, so the invocation count is not fixed and a bound that is safe once
     is not safe nine times. Raising BUILDX_TIMEOUT, weakening the reserve, or
     adding an os variant must all be caught here rather than by a five-hour job.
@@ -273,6 +277,40 @@ def test_the_whole_job_worst_case_fits_inside_the_jobs_own_cap():
                 f"worst case {worst:.0f}s over {n_variants} os variants x "
                 f"{n_tags} tags (push={push}) exceeds the job cap {cap}s"
             )
+
+
+# Slowest complete tail over 296 whole jobs in 90 days of CIDB (p50 40.3s, p99 70.7s):
+# every `docker library image test` row plus `Check README`, summed per job.
+UNBOUNDED_TAIL_OBSERVED_SECONDS = 133
+
+
+def test_the_reserve_still_covers_the_unbounded_phases_after_the_loop():
+    """main()'s tail is unbounded, so the loop must leave it room to finish.
+
+    test_docker_library and check_server_readme run after the loop and neither
+    takes a deadline, so nothing here bounds them; the only thing standing between
+    them and the cap is what the loop leaves unspent. A wider envelope or a smaller
+    reserve eats that room, which this catches rather than a five-hour job. The
+    margin asserted is an order of magnitude over the slowest observed tail,
+    because a phase that takes no deadline can only be sized by observation.
+
+    docker_login is deliberately excluded: it runs before the loop, so the
+    stopwatch the bound is derived from has already charged it.
+
+    Scoped to the scheduled variant count, unlike the envelope arm above: one
+    extra variant leaves 820s, which is six observed tails but under that margin,
+    and relaxing the margin to admit an unscheduled shape would pick the threshold
+    to fit the number. What that shape does to the cap is already the envelope
+    arm's canary.
+    """
+    cap = JobConfigs.docker_server.timeout
+    n_tags = len(gen_tags("26.8.1.1", "head"))
+    for push in (False, True):
+        slack = cap - _worst_case_job_seconds(len(_os_default()), n_tags, push, cap)
+        assert slack >= 10 * UNBOUNDED_TAIL_OBSERVED_SECONDS, (
+            f"{slack:.0f}s left for the unbounded tail (push={push}); the observed "
+            f"tail is {UNBOUNDED_TAIL_OBSERVED_SECONDS}s and it takes no deadline"
+        )
 
 
 def _effective_args(command, monkeypatch):
@@ -385,7 +423,7 @@ def _bounds(commands):
 def test_every_produced_command_gets_the_stopwatch_derived_bound(tmp_path, monkeypatch):
     """The envelope above proves the arithmetic; this proves it is wired in.
 
-    test_the_whole_job_worst_case_fits_inside_the_jobs_own_cap calls buildx_timeout
+    test_the_build_loops_worst_case_fits_inside_the_jobs_own_cap calls buildx_timeout
     directly, and the two wiring arms only count source substrings, so reverting both
     call sites to a fixed bound keeps every other arm green. Driving the real
     build_and_push_image and reading the bound back out of each command it produces is
