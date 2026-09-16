@@ -269,14 +269,14 @@ SELECT count() > 0 FROM (
 -- and the two spellings render identically in the plan, so only the pushed filter tells them apart.
 
 SELECT 'INNER JOIN ON, cross-type equi-key with a deterministic lambda body: the key reaches the right input';
-SELECT countIf(explain ILIKE '%Filter column%arrayMax%') = 1 FROM (
+SELECT countIf(explain ILIKE '%arrayMax%__filterpushdown_cast%') = 1 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = arrayMax(arrayMap(z -> z, [r.b]))
     WHERE l.a BETWEEN toDate32('2020-06-01') AND toDate32('2020-06-03')
 );
 
 SELECT 'INNER JOIN ON, cross-type equi-key whose lambda body is not stable within the query: the key does not';
-SELECT countIf(explain ILIKE '%Filter column%arrayMax%') = 0 FROM (
+SELECT countIf(explain ILIKE '%arrayMax%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = arrayMax(arrayMap(z -> z + (rand(z) % 1), [r.b]))
     WHERE l.a BETWEEN toDate32('2020-06-01') AND toDate32('2020-06-03')
@@ -288,7 +288,7 @@ SELECT countIf(explain ILIKE '%Filter column%arrayMax%') = 0 FROM (
 -- row, and the array is materialized because a constant one folds the whole call away before the plan.
 
 SELECT 'INNER JOIN ON, conjunct with a deterministic lambda body beside the equi-key: the conjunct is pushed';
-SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 1 FROM (
+SELECT countIf(explain ILIKE '%Filter column%arrayExists%__filterpushdown_cast%') = 1 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = r.b
     WHERE arrayExists(y -> y % 1 = 0, materialize([1])) = (l.a > toDate32('1900-01-01'))
@@ -296,7 +296,7 @@ SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 1 FROM (
 );
 
 SELECT 'INNER JOIN ON, conjunct with an unstable lambda body beside the equi-key: the conjunct is not pushed';
-SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 0 FROM (
+SELECT countIf(explain ILIKE '%Filter column%arrayExists%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = r.b
     WHERE arrayExists(y -> rand(y) % 1 = 0, materialize([1])) = (l.a > toDate32('1900-01-01'))
@@ -309,25 +309,25 @@ SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 0 FROM (
 -- evaluation, so only the plan tells these keys apart from a substitutable one.
 
 SELECT 'INNER JOIN ON, cross-type equi-key holding per-query state: the key does not reach the right input';
-SELECT countIf(explain ILIKE '%Filter column%timeSeriesStoreTags%') = 0 FROM (
+SELECT countIf(explain ILIKE '%Filter column%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
-    SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = timeSeriesStoreTags(r.b, map('n', 'v'))
+    SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = toDate(toUInt16(timeSeriesStoreTags(toUInt64(r.b), map('n', 'v'))))
     WHERE l.a BETWEEN toDate32('2020-06-01') AND toDate32('2020-06-03')
 );
 
 SELECT 'INNER JOIN ON, cross-type equi-key whose lambda body holds per-query state: the key does not either';
-SELECT countIf(explain ILIKE '%Filter column%arrayMax%') = 0 FROM (
+SELECT countIf(explain ILIKE '%arrayMax%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r
-        ON l.a = arrayMax(arrayMap(z -> timeSeriesStoreTags(z, map('n', 'v')), [r.b]))
+        ON l.a = arrayMax(arrayMap(z -> toDate(toUInt16(timeSeriesStoreTags(toUInt64(z), map('n', 'v')))), [r.b]))
     WHERE l.a BETWEEN toDate32('2020-06-01') AND toDate32('2020-06-03')
 );
 
 SELECT 'INNER JOIN ON, conjunct whose lambda body holds per-query state beside the equi-key: the conjunct is not pushed';
-SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 0 FROM (
+SELECT countIf(explain ILIKE '%Filter column%arrayExists%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = r.b
-    WHERE arrayExists(y -> timeSeriesStoreTags(y, map('n', 'v')) % 1 = 0, materialize([1])) = (l.a > toDate32('1900-01-01'))
+    WHERE arrayExists(y -> timeSeriesStoreTags(toUInt64(y), map('n', 'v')) % 1 = 0, materialize([1])) = (l.a > toDate32('1900-01-01'))
       AND l.a BETWEEN toDate32('2020-06-01') AND toDate32('2020-06-03')
 );
 
@@ -337,7 +337,7 @@ SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 0 FROM (
 -- not, and both spellings render alike, so only the pushed filter separates them.
 
 SELECT 'INNER JOIN ON, conjunct whose lambda body reads the value of a formal bound to the equi-key: the conjunct is pushed';
-SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 1 FROM (
+SELECT countIf(explain ILIKE '%Filter column%arrayExists%__filterpushdown_cast%') = 1 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = r.b
     WHERE arrayExists(y -> y > toDate32('1900-01-01'), [l.a]) = (l.a > toDate32('1900-01-01'))
@@ -345,7 +345,7 @@ SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 1 FROM (
 );
 
 SELECT 'INNER JOIN ON, conjunct whose lambda body reads the representation of a formal bound to the equi-key: it is not';
-SELECT countIf(explain ILIKE '%arrayExists%CAST(b AS Date32)%') = 0 FROM (
+SELECT countIf(explain ILIKE '%Filter column%arrayExists%__filterpushdown_cast%') = 0 FROM (
     EXPLAIN PLAN actions = 1
     SELECT count() FROM inner_d32 AS l INNER JOIN inner_d AS r ON l.a = r.b
     WHERE arrayExists(y -> isConstant(y) = 0, [l.a]) = (l.a > toDate32('1900-01-01'))
