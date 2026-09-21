@@ -9,7 +9,6 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/StorageID.h>
 #include <Parsers/ASTCreateQuery.h>
-#include <Core/UUID.h>
 #include <base/hex.h>
 
 #include <optional>
