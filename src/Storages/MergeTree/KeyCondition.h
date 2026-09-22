@@ -448,10 +448,7 @@ public:
     ///
     /// These atoms are relaxed when the associated constants undergo
     /// transformation by monotonic functions, as illustrated in the example
-    /// mentioned earlier. Two NaN rules relax them as well, each for the bound
-    /// its condition is evaluated against: a right-unbounded FUNCTION_IN_RANGE
-    /// atom over a key column that can hold a NaN inside a Tuple (see
-    /// relaxRangeAtomsOverNaNHidingTupleColumns), and, for a condition built
+    /// mentioned earlier. A NaN rule relaxes them as well: for a condition built
     /// over a getExtremes-derived hyperrectangle, a range or single-element set
     /// atom over any key column that can hide a NaN (see
     /// relaxAtomsOverNaNHidingColumns).
@@ -480,10 +477,6 @@ public:
     /// no ordering comparison, so it makes an atom true only through an enclosing negation: `can_be_true`
     /// without `can_be_false`, i.e. `relaxed`. Making one true directly needs `FUNCTION_UNKNOWN` instead.
     void relaxAtomsOverNaNHidingColumns(const DataTypes & key_types);
-
-    /// The primary-key counterpart of the above, for a NaN hidden inside a `Tuple` key column rather than
-    /// behind a `getExtremes` bound. Weaker on purpose: it keeps the exact-range machinery intact.
-    void relaxRangeAtomsOverNaNHidingTupleColumns(const DataTypes & key_types);
 
     bool isSinglePoint() const { return single_point; }
 
