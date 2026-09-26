@@ -17,24 +17,24 @@ DROP TABLE IF EXISTS t42;
 CREATE TABLE t41 (`time` DateTime, `c1` String, `s1` AggregateFunction(avg, Decimal(15, 4)), `s2` AggregateFunction(avg, Decimal(15, 4)))
 ENGINE = AggregatingMergeTree ORDER BY (c1, time)
 SETTINGS min_bytes_for_wide_part = 0, auto_statistics_types = '', index_granularity = 8192, index_granularity_bytes = 10485760;
-INSERT INTO t41 SELECT toDateTime('2026-01-01 00:00:00') + 60 * ((number * 2654435761) % 525600) AS time, hex(MD5(toString(number % 100000))) AS c1, arrayReduce('avgState', [CAST(number % 1000 AS Decimal(15, 4))]), arrayReduce('avgState', [CAST(number % 777 AS Decimal(15, 4))]) FROM numbers(4000000);
+INSERT INTO t41 SELECT toDateTime('2026-01-01 00:00:00') + 60 * ((number * 2654435761) % 525600) AS time, hex(MD5(toString(number % 25000))) AS c1, arrayReduce('avgState', [CAST(number % 1000 AS Decimal(15, 4))]), arrayReduce('avgState', [CAST(number % 777 AS Decimal(15, 4))]) FROM numbers(1000000);
 CREATE TABLE t42 (`m` DateTime, `c1` String) ENGINE = MergeTree ORDER BY c1;
 INSERT INTO t42 SELECT time, c1 FROM t41 WHERE time IN ('2026-08-07 08:35:00', '2026-08-07 08:47:00', '2026-08-07 09:40:00', '2026-08-08 12:04:00', '2026-08-08 20:04:00', '2026-08-09 11:03:00', '2026-08-09 16:32:00');
 
 -- The reporter's two queries: the limit is met without runtime filters ...
 SELECT a.c1, b.m, avgMerge(a.s1), avgMerge(a.s2) FROM t41 AS a INNER JOIN t42 AS b ON (a.time = b.m) AND (a.c1 = b.c1) WHERE a.time IN ('2026-08-07 08:35:00', '2026-08-07 08:47:00', '2026-08-07 09:40:00', '2026-08-08 12:04:00', '2026-08-08 20:04:00', '2026-08-09 11:03:00', '2026-08-09 16:32:00') GROUP BY a.c1, b.m ORDER BY a.c1, b.m
-SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '90000000', enable_join_runtime_filters = 0, log_comment = 'rf_off' FORMAT Null;
+SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '22500000', enable_join_runtime_filters = 0, log_comment = 'rf_off' FORMAT Null;
 -- ... and with them.
 SELECT a.c1, b.m, avgMerge(a.s1), avgMerge(a.s2) FROM t41 AS a INNER JOIN t42 AS b ON (a.time = b.m) AND (a.c1 = b.c1) WHERE a.time IN ('2026-08-07 08:35:00', '2026-08-07 08:47:00', '2026-08-07 09:40:00', '2026-08-08 12:04:00', '2026-08-08 20:04:00', '2026-08-09 11:03:00', '2026-08-09 16:32:00') GROUP BY a.c1, b.m ORDER BY a.c1, b.m
-SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '90000000', enable_join_runtime_filters = 1, log_comment = 'rf_on';
+SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '22500000', enable_join_runtime_filters = 1, log_comment = 'rf_on';
 
 -- With reordering disabled, the runtime filter must not be the one condition moved to PREWHERE.
 SELECT a.c1, b.m, avgMerge(a.s1), avgMerge(a.s2) FROM t41 AS a INNER JOIN t42 AS b ON (a.time = b.m) AND (a.c1 = b.c1) WHERE a.time IN ('2026-08-07 08:35:00', '2026-08-07 08:47:00', '2026-08-07 09:40:00', '2026-08-08 12:04:00', '2026-08-08 20:04:00', '2026-08-09 11:03:00', '2026-08-09 16:32:00') GROUP BY a.c1, b.m ORDER BY a.c1, b.m
-SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '90000000', enable_join_runtime_filters = 1, allow_reorder_prewhere_conditions = 0, move_all_conditions_to_prewhere = 0, log_comment = 'rf_c' FORMAT Null;
+SETTINGS join_algorithm = 'grace_hash', max_bytes_to_read = '22500000', enable_join_runtime_filters = 1, allow_reorder_prewhere_conditions = 0, move_all_conditions_to_prewhere = 0, log_comment = 'rf_c' FORMAT Null;
 
 -- LEFT ANTI JOIN on a Nullable key, whose runtime filter also passes NULL keys.
 SELECT count() FROM t41 AS a LEFT ANTI JOIN t42 AS b ON toNullable(a.c1) = b.c1 WHERE a.time IN ('2026-08-07 08:35:00', '2026-08-07 08:47:00', '2026-08-07 09:40:00', '2026-08-08 12:04:00', '2026-08-08 20:04:00', '2026-08-09 11:03:00', '2026-08-09 16:32:00')
-SETTINGS join_algorithm = 'hash', max_bytes_to_read = '90000000', enable_join_runtime_filters = 1, log_comment = 'rf_d';
+SETTINGS join_algorithm = 'hash', max_bytes_to_read = '22500000', enable_join_runtime_filters = 1, log_comment = 'rf_d';
 
 SYSTEM FLUSH LOGS query_log;
 -- Every query that enables runtime filters must have checked rows with them, and the one that disables them must not.
