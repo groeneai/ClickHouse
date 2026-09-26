@@ -481,16 +481,27 @@ public:
 
         ProfileEvents::increment(ProfileEvents::FileOpen);
 
+        /// Another storage with the same path may still be reading the old file, so it is replaced, not truncated.
+        const std::string new_file_path = fmt::format("{}.{}.tmp", file_path, randomSeed());
+
         #if defined(OS_DARWIN)
         /// macOS has no O_DIRECT; F_NOCACHE (set below) is the closest equivalent.
-        file.fd = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+        file.fd = ::open(new_file_path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
         #else
-        file.fd = ::open(file_path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0666);
+        file.fd = ::open(new_file_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_DIRECT, 0666);
         #endif
         if (file.fd == -1)
         {
             auto error_code = (errno == ENOENT) ? ErrorCodes::FILE_DOESNT_EXIST : ErrorCodes::CANNOT_OPEN_FILE;
-            ErrnoException::throwFromPath(error_code, file_path, "Cannot open file {}", file_path);
+            ErrnoException::throwFromPath(error_code, file_path, "Cannot open file {}", new_file_path);
+        }
+
+        if (::rename(new_file_path.c_str(), file_path.c_str()) != 0)
+        {
+            int rename_errno = errno;
+            ::unlink(new_file_path.c_str());
+            ErrnoException::throwFromPathWithErrno(
+                ErrorCodes::CANNOT_OPEN_FILE, file_path, rename_errno, "Cannot rename {} to {}", new_file_path, file_path);
         }
 
         #if defined(OS_DARWIN)
