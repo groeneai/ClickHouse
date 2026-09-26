@@ -1193,6 +1193,32 @@ static std::set<ProjectionDescriptionRawPtr> getProjectionsToRecalculate(
     return projections_to_recalc;
 }
 
+/// Projections whose part in @source_part was sorted and indexed under other key types: a mutation rebuilds them
+/// instead of cloning or hardlinking the projection part forward.
+static MutationCommands getStaleProjectionsToRebuild(
+    const MergeTreeDataPartPtr & source_part,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MutationCommands & commands_for_part)
+{
+    NameSet projections_in_commands;
+    for (const auto & command : commands_for_part)
+    {
+        if (command.type == MutationCommand::Type::DROP_PROJECTION)
+            projections_in_commands.insert(command.column_name);
+        else if (command.type == MutationCommand::Type::MATERIALIZE_PROJECTION)
+            projections_in_commands.insert(command.projection_name);
+    }
+
+    MutationCommands result;
+    for (const auto & projection : metadata_snapshot->getProjections())
+    {
+        /// A broken projection part is included: an eagerly loaded index that no longer decodes is what broke it.
+        if (!projections_in_commands.contains(projection.name) && projection.isSortingKeyStaleInPart(*source_part))
+            result.push_back({.type = MutationCommand::Type::MATERIALIZE_PROJECTION, .projection_name = projection.name});
+    }
+    return result;
+}
+
 static std::unordered_map<String, size_t> getStreamCounts(
     const MergeTreeDataPartPtr & data_part,
     const MergeTreeDataPartChecksums & source_part_checksums,
@@ -3655,7 +3681,8 @@ static bool canSkipConversionToVariant(const MergeTreeDataPartPtr & part, const 
     return isVariantExtension(part_column->type, command.data_type);
 }
 
-static bool canSkipMutationCommandForPart(const MergeTreeDataPartPtr & part, const StorageMetadataPtr & metadata_snapshot, const MutationCommand & command, const ContextPtr & context)
+/// Is @command scoped (IN PARTITION) to partitions other than the one of @part?
+static bool isMutationCommandForOtherPartition(const MergeTreeDataPartPtr & part, const MutationCommand & command, const ContextPtr & context)
 {
     if (auto alter = command.ast(); alter && alter->partition)
     {
@@ -3678,6 +3705,14 @@ static bool canSkipMutationCommandForPart(const MergeTreeDataPartPtr & part, con
         if (!part_in_partitions)
             return true;
     }
+
+    return false;
+}
+
+static bool canSkipMutationCommandForPart(const MergeTreeDataPartPtr & part, const StorageMetadataPtr & metadata_snapshot, const MutationCommand & command, const ContextPtr & context)
+{
+    if (isMutationCommandForOtherPartition(part, command, context))
+        return true;
 
     /// APPLY PATCHES command is handled separately.
     if (command.type == MutationCommand::APPLY_PATCHES)
@@ -4003,8 +4038,10 @@ bool MutateTask::prepare()
     /// disable parallel replicas for mutations
     context_for_reading->setSetting("enable_parallel_replicas", false);
 
+    bool mutation_applies_to_part = false;
     for (const auto & command : *ctx->commands)
     {
+        mutation_applies_to_part |= !isMutationCommandForOtherPartition(ctx->source_part, command, context_for_reading);
         if (!canSkipMutationCommandForPart(ctx->source_part, ctx->metadata_snapshot, command, context_for_reading))
             ctx->commands_for_part.emplace_back(command);
     }
@@ -4038,7 +4075,15 @@ bool MutateTask::prepare()
         [&my_ctx = *ctx](const Progress &) { my_ctx.checkOperationIsNotCanceled(); }
     );
 
-    if (!is_storage_touched.any_rows_affected)
+    /// A part the mutation does not apply to (another partition) is cloned as before; reads and merges guard it.
+    MutationCommands stale_projections;
+    if (mutation_applies_to_part)
+        stale_projections = MutationHelpers::getStaleProjectionsToRebuild(ctx->source_part, ctx->metadata_snapshot, ctx->commands_for_part);
+    for (const auto & command : stale_projections)
+        LOG_DEBUG(ctx->log, "Projection {} of part {} was sorted under other key types and will be rebuilt",
+            command.projection_name, ctx->source_part->name);
+
+    if (!is_storage_touched.any_rows_affected && stale_projections.empty())
     {
         NameSet files_to_copy_instead_of_hardlinks;
         auto settings_ptr = ctx->data->getSettings();
@@ -4112,6 +4157,11 @@ bool MutateTask::prepare()
             return false;
         }
     }
+
+    /// Like the clone, a mutation that changes no row of the part applies nothing to it but the rebuilds.
+    if (!is_storage_touched.any_rows_affected)
+        ctx->commands_for_part.clear();
+    ctx->commands_for_part.insert(ctx->commands_for_part.end(), stale_projections.begin(), stale_projections.end());
 
     LOG_TRACE(ctx->log, "Mutating part {} to mutation version {}", ctx->source_part->name, ctx->future_part->part_info.mutation);
 

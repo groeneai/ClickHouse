@@ -344,6 +344,7 @@ size_t filterPartsByProjection(
 /// was re-pointed by ALTER, changing the materialized source column or the aggregate-state column
 /// name). Reading a column the projection part lacks would fill defaults and return wrong data.
 /// For each required column there are four cases:
+///   (0) its sort order was written for other key types: read from the parent.
 ///   (1) the projection part stores the column:
 ///       usable, keep checking.
 ///   (2) the column is virtual:
@@ -361,6 +362,9 @@ static bool projectionPartHasRequiredColumns(
     const StorageMetadataPtr & parent_metadata,
     const Names & required_column_names)
 {
+    if (projection.isSortingKeyStaleInPart(parent_part))
+        return false;
+
     const auto & parent_table_columns = parent_metadata->getColumns();
 
     for (const auto & name : required_column_names)
