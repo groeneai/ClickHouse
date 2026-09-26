@@ -64,9 +64,8 @@ static ActionsDAG makeReorderingActions(const Block & in_header, const GroupingS
 MergingAggregatedTransform::~MergingAggregatedTransform() = default;
 
 MergingAggregatedTransform::MergingAggregatedTransform(
-    SharedHeader header_, Aggregator::Params params, bool final, GroupingSetsParamsList grouping_sets_params, size_t output_streams_)
+    SharedHeader header_, Aggregator::Params params, bool final, GroupingSetsParamsList grouping_sets_params)
     : IAccumulatingTransform(header_, std::make_shared<const Block>(appendGroupingIfNeeded(*header_, params.getHeader(*header_, final))))
-    , output_streams(output_streams_)
 {
     if (!grouping_sets_params.empty())
     {
@@ -259,8 +258,7 @@ Chunk MergingAggregatedTransform::generate()
 
             /// TODO: this operation can be made async. Add async for IAccumulatingTransform.
             params->aggregator.mergeBlocks(std::move(bucket_to_chunks), data_variants, is_cancelled);
-            const size_t max_rows_per_block = Aggregator::singleLevelChunkRowsForFanOut(data_variants.sizeWithoutOverflowRow(), output_streams);
-            auto merged_chunks = params->aggregator.convertToChunks(data_variants, params->final, max_rows_per_block);
+            auto merged_chunks = params->aggregator.convertToChunks(data_variants, params->final);
 
             if (grouping_set.creating_missing_keys_actions)
             {

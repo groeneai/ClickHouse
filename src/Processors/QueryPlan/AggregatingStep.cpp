@@ -51,7 +51,7 @@ namespace QueryPlanSerializationSetting
     extern const QueryPlanSerializationSettingsOverflowModeGroupBy group_by_overflow_mode;
     extern const QueryPlanSerializationSettingsUInt64 group_by_two_level_threshold_bytes;
     extern const QueryPlanSerializationSettingsUInt64 group_by_two_level_threshold;
-    extern const QueryPlanSerializationSettingsNonZeroUInt64 max_block_size;
+    extern const QueryPlanSerializationSettingsUInt64 max_block_size;
     extern const QueryPlanSerializationSettingsUInt64 max_bytes_before_external_group_by;
     extern const QueryPlanSerializationSettingsUInt64 max_entries_for_hash_table_stats;
     extern const QueryPlanSerializationSettingsUInt64 max_rows_to_group_by;
@@ -474,10 +474,6 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
             });
         }
 
-        /// The per-set results are spread over `max_threads` streams below, so split a small single-level
-        /// result of each set for that width as for an ordinary aggregation.
-        const size_t grouping_sets_output_streams = should_produce_results_in_order_of_bucket_number ? 1 : params.max_threads;
-
         pipeline.transform([&](OutputPortRawPtrs ports)
         {
             chassert(streams * grouping_sets_size == ports.size());
@@ -501,8 +497,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                             new_temporary_data_merge_threads,
                             should_produce_results_in_order_of_bucket_number,
                             skip_merging,
-                            nullptr,
-                            grouping_sets_output_streams);
+                            nullptr);
                         // For each input stream we have `grouping_sets_size` copies, so port index
                         // for transform #j should skip ports of first (j-1) streams.
                         connect(*ports[i + grouping_sets_size * j], aggregation_for_set->getInputs().front());
@@ -513,7 +508,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                 else
                 {
                     auto aggregation_for_set
-                        = std::make_shared<AggregatingTransform>(input_header, transform_params_for_set, dataflow_cache_updater, grouping_sets_output_streams);
+                        = std::make_shared<AggregatingTransform>(input_header, transform_params_for_set, dataflow_cache_updater);
                     connect(*ports[i], aggregation_for_set->getInputs().front());
                     ports[i] = &aggregation_for_set->getOutputs().front();
                     processors.push_back(aggregation_for_set);
@@ -703,8 +698,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     new_temporary_data_merge_threads,
                     should_produce_results_in_order_of_bucket_number,
                     skip_merging,
-                    dataflow_cache_updater,
-                    streams_after_aggregation);
+                    dataflow_cache_updater);
             });
 
         pipeline.resize(streams_after_aggregation, false, settings.min_outstreams_per_resize_after_split);
@@ -714,7 +708,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
     else
     {
         pipeline.addSimpleTransform([&](const SharedHeader & header)
-                                    { return std::make_shared<AggregatingTransform>(header, transform_params, dataflow_cache_updater, streams_after_aggregation); });
+                                    { return std::make_shared<AggregatingTransform>(header, transform_params, dataflow_cache_updater); });
 
         pipeline.resize(streams_after_aggregation);
 
