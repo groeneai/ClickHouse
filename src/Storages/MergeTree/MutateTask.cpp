@@ -1193,8 +1193,6 @@ static std::set<ProjectionDescriptionRawPtr> getProjectionsToRecalculate(
     return projections_to_recalc;
 }
 
-/// Projections whose part in @source_part was sorted and indexed under other key types: a mutation rebuilds them
-/// instead of cloning or hardlinking the projection part forward.
 static MutationCommands getStaleProjectionsToRebuild(
     const MergeTreeDataPartPtr & source_part,
     const StorageMetadataPtr & metadata_snapshot,
@@ -3681,7 +3679,6 @@ static bool canSkipConversionToVariant(const MergeTreeDataPartPtr & part, const 
     return isVariantExtension(part_column->type, command.data_type);
 }
 
-/// Is @command scoped (IN PARTITION) to partitions other than the one of @part?
 static bool isMutationCommandForOtherPartition(const MergeTreeDataPartPtr & part, const MutationCommand & command, const ContextPtr & context)
 {
     if (auto alter = command.ast(); alter && alter->partition)
@@ -4075,7 +4072,6 @@ bool MutateTask::prepare()
         [&my_ctx = *ctx](const Progress &) { my_ctx.checkOperationIsNotCanceled(); }
     );
 
-    /// A part the mutation does not apply to (another partition) is cloned as before; reads and merges guard it.
     MutationCommands stale_projections;
     if (mutation_applies_to_part)
         stale_projections = MutationHelpers::getStaleProjectionsToRebuild(ctx->source_part, ctx->metadata_snapshot, ctx->commands_for_part);

@@ -100,7 +100,6 @@ bool ProjectionDescription::isSortingKeyStaleInPart(const IMergeTreeDataPart & p
     if (it == projection_parts.end())
         return false;
 
-    /// The part's own list: the storage-wide columns cache interns lists that differ by equals()-invisible attributes.
     const auto & part_columns = it->second->getColumns();
     auto recorded_type = [&](const String & column_name) -> DataTypePtr
     {
@@ -120,7 +119,6 @@ bool ProjectionDescription::isSortingKeyStaleInPart(const IMergeTreeDataPart & p
         return false;
     const auto & key_inputs = sorting_key.expression->getRequiredColumnsWithTypes();
 
-    /// The key's own values, as `primary.cidx` holds them.
     for (size_t i = 0; i < sorting_key.column_names.size(); ++i)
         if (auto part_type = recorded_type(sorting_key.column_names[i]);
             part_type && !isRepresentationPreservingConversion(part_type.get(), sorting_key.data_types[i].get()))
