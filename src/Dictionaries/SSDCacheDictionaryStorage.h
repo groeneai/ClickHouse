@@ -511,20 +511,24 @@ public:
             ErrnoException::throwFromPath(error_code, file_path, "Cannot create file {} to replace {}", new_file_path, target_file_path);
         }
 
-        if (::rename(new_file_path.c_str(), target_file_path.c_str()) != 0)
+        try
         {
-            int rename_errno = errno;
-            ::unlink(new_file_path.c_str());
-            ErrnoException::throwFromPathWithErrno(
-                ErrorCodes::CANNOT_OPEN_FILE, file_path, rename_errno, "Cannot rename {} to {}", new_file_path, target_file_path);
+            #if defined(OS_DARWIN)
+            if (::fcntl(file.fd, F_NOCACHE, 1) == -1)
+                ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, file_path, "Cannot set F_NOCACHE on file {}", file_path);
+            #endif
+
+            allocateSizeForNextPartition();
+
+            if (::rename(new_file_path.c_str(), target_file_path.c_str()) != 0)
+                ErrnoException::throwFromPath(
+                    ErrorCodes::CANNOT_OPEN_FILE, file_path, "Cannot rename {} to {}", new_file_path, target_file_path);
         }
-
-        #if defined(OS_DARWIN)
-        if (::fcntl(file.fd, F_NOCACHE, 1) == -1)
-            ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, file_path, "Cannot set F_NOCACHE on file {}", file_path);
-        #endif
-
-        allocateSizeForNextPartition();
+        catch (...)
+        {
+            ::unlink(new_file_path.c_str());
+            throw;
+        }
     }
 
     void allocateSizeForNextPartition()
