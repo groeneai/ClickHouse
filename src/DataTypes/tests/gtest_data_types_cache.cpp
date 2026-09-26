@@ -165,9 +165,11 @@ TEST(DataTypesCache, ThreadsDoNotShareSerializationReferenceCounter)
         SerializationPtr from_other_thread;
         std::thread([&] { from_other_thread = getDataTypesCache().getSerialization(type_name); }).join();
         SerializationPtr from_this_thread = getDataTypesCache().getSerialization(type_name);
+        SerializationPtr again_from_this_thread = getDataTypesCache().getSerialization(type_name);
 
-        /// The same pooled serialization, owned through a separate reference counter in each thread.
+        /// The same pooled serialization, owned through one reference counter per thread.
         ASSERT_EQ(from_other_thread.get(), from_this_thread.get());
         ASSERT_TRUE(from_other_thread.owner_before(from_this_thread) || from_this_thread.owner_before(from_other_thread));
+        ASSERT_FALSE(from_this_thread.owner_before(again_from_this_thread) || again_from_this_thread.owner_before(from_this_thread));
     }
 }
