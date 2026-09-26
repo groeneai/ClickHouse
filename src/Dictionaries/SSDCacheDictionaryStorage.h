@@ -483,7 +483,7 @@ public:
         ProfileEvents::increment(ProfileEvents::FileOpen);
 
         /// Another storage with the same path may still be reading the old file, so it is replaced, not truncated.
-        /// A symlink at the path is followed, as the in-place open did, and the file it points to is replaced.
+        /// rename(2) overwrites a symlink, not the file it points to, so the link is resolved first.
         std::filesystem::path target_path = file_path;
         for (size_t hops = 0; target_path.has_filename() && FS::isSymlinkNoThrow(target_path); ++hops)
         {
@@ -493,7 +493,7 @@ public:
         }
         const std::string target_file_path = target_path.string();
 
-        /// rename(2) checks only the directory's permissions: an existing file the server cannot read and write must not be replaced.
+        /// rename(2) ignores the replaced file's permissions: a file the server cannot read and write must not be replaced.
         if (::access(target_file_path.c_str(), R_OK | W_OK) != 0 && errno != ENOENT)
             ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, file_path, "Cannot open file {}", target_file_path);
 
