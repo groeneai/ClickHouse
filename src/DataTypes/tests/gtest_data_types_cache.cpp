@@ -10,6 +10,8 @@
 #include <DataTypes/DataTypesCache.h>
 #include <Interpreters/Context.h>
 
+#include <thread>
+
 using namespace DB;
 
 namespace
@@ -153,4 +155,19 @@ TEST(DataTypesCache, InvalidatedOnSessionTimezoneChangeWithinOneContext)
     client_context->setSetting("session_timezone", String("Europe/Amsterdam"));
 
     ASSERT_EQ(cachedDateTimeTimezone(), "Europe/Amsterdam");
+}
+
+TEST(DataTypesCache, ThreadsDoNotShareSerializationReferenceCounter)
+{
+    /// `Int64` is served by `SimpleDataTypesCache`, `Array(Nullable(Int64))` by the `DataTypesCache` map.
+    for (const char * type_name : {"Int64", "Array(Nullable(Int64))"})
+    {
+        SerializationPtr from_other_thread;
+        std::thread([&] { from_other_thread = getDataTypesCache().getSerialization(type_name); }).join();
+        SerializationPtr from_this_thread = getDataTypesCache().getSerialization(type_name);
+
+        /// The same pooled serialization, owned through a separate reference counter in each thread.
+        ASSERT_EQ(from_other_thread.get(), from_this_thread.get());
+        ASSERT_TRUE(from_other_thread.owner_before(from_this_thread) || from_this_thread.owner_before(from_other_thread));
+    }
 }
