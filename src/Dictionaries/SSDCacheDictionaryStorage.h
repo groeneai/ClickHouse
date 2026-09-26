@@ -485,13 +485,18 @@ public:
         /// Another storage with the same path may still be reading the old file, so it is replaced, not truncated.
         /// A symlink at the path is followed, as the in-place open did, and the file it points to is replaced.
         std::filesystem::path target_path = file_path;
-        for (size_t hops = 0; FS::isSymlink(target_path); ++hops)
+        for (size_t hops = 0; target_path.has_filename() && FS::isSymlinkNoThrow(target_path); ++hops)
         {
             if (hops == 40)
                 ErrnoException::throwFromPathWithErrno(ErrorCodes::CANNOT_OPEN_FILE, file_path, ELOOP, "Cannot open file {}", file_path);
             target_path = target_path.parent_path() / FS::readSymlink(target_path);
         }
         const std::string target_file_path = target_path.string();
+
+        /// rename(2) checks only the directory's permissions: an existing file the server cannot read and write must not be replaced.
+        if (::access(target_file_path.c_str(), R_OK | W_OK) != 0 && errno != ENOENT)
+            ErrnoException::throwFromPath(ErrorCodes::CANNOT_OPEN_FILE, file_path, "Cannot open file {}", target_file_path);
+
         const std::string new_file_path = (target_path.parent_path() / fmt::format("ssd_cache_{}.tmp", randomSeed())).string();
 
         #if defined(OS_DARWIN)
@@ -503,7 +508,7 @@ public:
         if (file.fd == -1)
         {
             auto error_code = (errno == ENOENT) ? ErrorCodes::FILE_DOESNT_EXIST : ErrorCodes::CANNOT_OPEN_FILE;
-            ErrnoException::throwFromPath(error_code, file_path, "Cannot open file {}", new_file_path);
+            ErrnoException::throwFromPath(error_code, file_path, "Cannot create file {} to replace {}", new_file_path, target_file_path);
         }
 
         if (::rename(new_file_path.c_str(), target_file_path.c_str()) != 0)
