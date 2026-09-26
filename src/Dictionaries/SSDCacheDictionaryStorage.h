@@ -13,6 +13,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <Common/ErrnoException.h>
 #include <Common/ProfileEvents.h>
+#include <Common/filesystemHelpers.h>
 
 #    include <base/MemorySanitizer.h>
 #    include <Dictionaries/DictionaryHelpers.h>
@@ -482,7 +483,16 @@ public:
         ProfileEvents::increment(ProfileEvents::FileOpen);
 
         /// Another storage with the same path may still be reading the old file, so it is replaced, not truncated.
-        const std::string new_file_path = fmt::format("{}.{}.tmp", file_path, randomSeed());
+        /// A symlink at the path is followed, as the in-place open did, and the file it points to is replaced.
+        std::filesystem::path target_path = file_path;
+        for (size_t hops = 0; FS::isSymlink(target_path); ++hops)
+        {
+            if (hops == 40)
+                ErrnoException::throwFromPathWithErrno(ErrorCodes::CANNOT_OPEN_FILE, file_path, ELOOP, "Cannot open file {}", file_path);
+            target_path = target_path.parent_path() / FS::readSymlink(target_path);
+        }
+        const std::string target_file_path = target_path.string();
+        const std::string new_file_path = (target_path.parent_path() / fmt::format("ssd_cache_{}.tmp", randomSeed())).string();
 
         #if defined(OS_DARWIN)
         /// macOS has no O_DIRECT; F_NOCACHE (set below) is the closest equivalent.
@@ -496,12 +506,12 @@ public:
             ErrnoException::throwFromPath(error_code, file_path, "Cannot open file {}", new_file_path);
         }
 
-        if (::rename(new_file_path.c_str(), file_path.c_str()) != 0)
+        if (::rename(new_file_path.c_str(), target_file_path.c_str()) != 0)
         {
             int rename_errno = errno;
             ::unlink(new_file_path.c_str());
             ErrnoException::throwFromPathWithErrno(
-                ErrorCodes::CANNOT_OPEN_FILE, file_path, rename_errno, "Cannot rename {} to {}", new_file_path, file_path);
+                ErrorCodes::CANNOT_OPEN_FILE, file_path, rename_errno, "Cannot rename {} to {}", new_file_path, target_file_path);
         }
 
         #if defined(OS_DARWIN)
