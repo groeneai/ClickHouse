@@ -20,7 +20,7 @@ namespace ErrorCodes
 namespace
 {
 
-/// Serializations are pooled, so their reference counter is shared by all threads.
+/// Pooled serializations share one reference counter between all threads.
 SerializationPtr withThreadLocalCounter(SerializationPtr serialization)
 {
     const ISerialization * raw = serialization.get();
