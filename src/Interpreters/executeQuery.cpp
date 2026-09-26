@@ -1180,10 +1180,11 @@ void validateAnalyzerSettings(ASTPtr ast)
     }
 }
 
-/// Remove the resource-limit settings that executeASTFuzzerQueries pins on the fuzz context from the
-/// query-level SETTINGS carriers of the fuzzed AST. These caps (row/time/memory/result/block-size
-/// limits) keep a single fuzzed query from running away. They are applied to the fuzz context up front, but
-/// executeQueryImpl re-applies the query's own SETTINGS on top of the context
+/// Remove the safety settings that executeASTFuzzerQueries pins on the fuzz context from the
+/// query-level SETTINGS carriers of the fuzzed AST, plus `profile`, whose change would re-install a whole
+/// profile over them. The caps (row/time/memory/result/block-size limits) keep a single fuzzed query from
+/// running away, and the stream-like direct-select ban keeps it from consuming a queue. They are applied to
+/// the fuzz context up front, but executeQueryImpl re-applies the query's own SETTINGS on top of the context
 /// (InterpreterSetQuery::applySettingsFromQuery), so a seed or fuzzed `SETTINGS max_rows_to_read = 0`
 /// (or `= DEFAULT`, which resets the cap back to its unbounded default), including from a BACKUP or
 /// CREATE clause, would otherwise silently lift the guard. Stripping them from the AST before
@@ -1203,6 +1204,8 @@ static void stripFuzzerSafetyLimitSettings(const ASTPtr & ast)
         "max_result_bytes",
         "max_block_size",
         "min_insert_block_size_rows",
+        "stream_like_engine_allow_direct_select",
+        "profile",
     };
 
     removeSettingsFromQuery(ast, limit_settings);
@@ -3633,6 +3636,8 @@ static void executeASTFuzzerQueries(const ASTPtr & ast, const ContextMutablePtr 
             fuzz_context->clearTableFunctionResults();
             fuzz_context->setSetting("ast_fuzzer_runs", Field(Float64(0)));
             fuzz_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(UInt64(0)));
+            /// A direct read of a stream-like table (Kafka, FileLog, ...) consumes its messages, which may belong to another session.
+            fuzz_context->setSetting("stream_like_engine_allow_direct_select", Field(false));
 
             /// Limit resources for each fuzzed query to prevent runaway execution.
             fuzz_context->setSetting("max_execution_time", Field(UInt64(10)));
