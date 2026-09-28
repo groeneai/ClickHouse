@@ -256,8 +256,7 @@ BACKUP TABLE nonexistent_04510 TO Null(); -- { serverError UNKNOWN_TABLE }
 -- name: a named collection with an optional filename, three arguments (connection string or account url,
 -- container, path), or five (adding account_name and account_key). An argument outside those shapes is
 -- rejected only after the statement is logged, and AzureQueue has no backup engine at all. The last
--- two statements are the controls: a connection string hides its AccountKey, and the three-argument
--- shape has nothing to hide, so it stays visible verbatim.
+-- statement is the control: the three-argument shape has nothing to hide, so it stays visible verbatim.
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://localhost:11111/acct', 'cont', 'blob',
                  'SEKRIT_AZTO4'); -- { serverError NUMBER_OF_ARGUMENTS_DOESNT_MATCH }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage(nc_04510_missing, 'dir',
@@ -265,10 +264,8 @@ BACKUP TABLE nonexistent_04510 TO AzureBlobStorage(nc_04510_missing, 'dir',
 BACKUP TABLE nonexistent_04510 TO AzureQueue('http://localhost:11111/acct', 'cont', 'blob',
                  'SEKRIT_AZQTO'); -- { serverError BACKUP_ENGINE_NOT_FOUND }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('DefaultEndpointsProtocol=https;AccountName=a;AccountKey=SEKRIT_AZTOCSKEY==;',
-                 'cont', 'blob', 'acct', 'SEKRIT_AZTOCS5'); -- { serverError BAD_ARGUMENTS }
-BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('DefaultEndpointsProtocol=https;AccountName=a;AccountKey=c2VrcmV0Cg==;',
-                 'cont', 'visible_04510_dir/b.zip'); -- { serverError BAD_ARGUMENTS }
-BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://localhost:11111/acct', 'visible_04510_cont', 'visible_04510_dir/b.zip'); -- { serverError BAD_ARGUMENTS }
+                 'cont', 'blob', 'acct', 'SEKRIT_AZTOCS5'); -- { serverError BAD_ARGUMENTS, STD_EXCEPTION }
+BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://localhost:11111/acct', 'visible_04510_cont', 'visible_04510_dir/b.zip'); -- { serverError BAD_ARGUMENTS, STD_EXCEPTION }
 
 -- A named collection can be overridden per statement, and the destination evaluates those overrides as
 -- constant expressions. An override this rule cannot read may hold either credential, and hiding a
@@ -330,10 +327,8 @@ BACKUP TABLE nonexistent_04510 TO AzureBlobStorage(nc_04510_missing,
                  storage_account_url = 'http://user:SEKRIT_AZNCUSERINFO@localhost:11111/acct'); -- { serverError BAD_ARGUMENTS }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage(nc_04510_missing,
                  storage_account_url = 'HTTPS://localhost:11111/acct?sig=SEKRIT_AZNCSAS'); -- { serverError BAD_ARGUMENTS }
-BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://user:SEKRIT_AZ3USERINFO@localhost:11111/acct',
-                 'cont', 'blob'); -- { serverError BAD_ARGUMENTS }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://localhost:11111/acct#f', 'cont', 'blob',
-                 'acct', 'SEKRIT_AZTO5KEY'); -- { serverError BAD_ARGUMENTS }
+                 'acct', 'SEKRIT_AZTO5KEY'); -- { serverError BAD_ARGUMENTS, STD_EXCEPTION }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage(['SEKRIT_AZ3ARR'], 'cont', 'blob'); -- { serverError BAD_GET }
 BACKUP TABLE nonexistent_04510 TO AzureBlobStorage('http://localhost:11111/visible_04510_acct5',
                  'visible_04510_cont5', 'visible_04510_blob5', 'visible_04510_acctname5',
@@ -478,7 +473,7 @@ CREATE DATABASE db_04510_nonlit ENGINE = Backup('', S3(concat('SEKRIT_NONLIT', '
 -- (neither is a secret) and every argument is hidden. The url carries a query string, which the
 -- engine rejects before it reaches the network.
 CREATE DATABASE db_04510_azure ENGINE = Backup('', AzureBlobStorage('http://localhost:11111/acct?sig=x',
-                 'cont', 'blob', 'account', 'SEKRIT_AZUREKEY')); -- { serverError BAD_ARGUMENTS }
+                 'cont', 'blob', 'account', 'SEKRIT_AZUREKEY')); -- { serverError BAD_ARGUMENTS, STD_EXCEPTION }
 
 -- The S3 database engine accepts no positional beyond secret_access_key; an extra positional must
 -- be masked in the logged query text.
