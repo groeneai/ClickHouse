@@ -72,13 +72,15 @@ FROM (
 -- non-zero seed feeds the join order optimizer random cardinalities, which can reverse the two
 -- join inputs; the reversed plan prints the right-hand branch first and `fl < ll` then compares
 -- lines from different branches.
+-- The Filter merged after a runtime filter is added can print without a step description, so
+-- these two arms match the step name (`Filter` or `Filter (...)`) rather than `Filter (`.
 DROP TABLE IF EXISTS t_04366_rhs;
 CREATE TABLE t_04366_rhs (key String) ENGINE = MergeTree ORDER BY key AS SELECT '5';
 
 SELECT (has_filter AND fl < ll) AS filter_above_limitby
 FROM (
-    SELECT countIf(explain LIKE '%Filter (%') > 0 AS has_filter,
-           minIf(ln, explain LIKE '%Filter (%') AS fl,
+    SELECT countIf(match(explain, '^[│├└─ ]*Filter( \(|$)')) > 0 AS has_filter,
+           minIf(ln, match(explain, '^[│├└─ ]*Filter( \(|$)')) AS fl,
            minIf(ln, explain LIKE '%LimitBy%')  AS ll
     FROM (
         SELECT explain, rowNumberInAllBlocks() AS ln
@@ -97,8 +99,8 @@ FROM (
 
 SELECT (has_filter AND fl < ll) AS filter_above_limitby
 FROM (
-    SELECT countIf(explain LIKE '%Filter (%') > 0 AS has_filter,
-           minIf(ln, explain LIKE '%Filter (%') AS fl,
+    SELECT countIf(match(explain, '^[│├└─ ]*Filter( \(|$)')) > 0 AS has_filter,
+           minIf(ln, match(explain, '^[│├└─ ]*Filter( \(|$)')) AS fl,
            minIf(ln, explain LIKE '%LimitBy%')  AS ll
     FROM (
         SELECT explain, rowNumberInAllBlocks() AS ln
