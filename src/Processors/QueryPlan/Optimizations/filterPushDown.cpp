@@ -646,6 +646,10 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
     /// Names substituted by a cast of the opposite side's key, as opposed to the equal-typed renames below.
     NameSet cross_type_equivalent_columns;
 
+    /// The cast cannot keep the replaced name: the filter's inputs are later bound by name both to the
+    /// JOIN output actions (`get_required_pre_actions`) and to the pre-filter DAG (`ActionsDAG::merge`),
+    /// and under the original name they would pick up the JOIN's own conversion of that name, which
+    /// reads the column of the other side. Same reason as for `__filterpushdown_src` below.
     auto create_replacement_name = [&](const String & replaced_name)
     {
         String name = fmt::format("__filterpushdown_cast{}", replaced_name);
