@@ -1912,6 +1912,15 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         }
     }
 
+    /// Columns written by the stages before the i-th one.
+    std::vector<NameSet> written_before(prepared_stages.size());
+    for (size_t i = 1; i < prepared_stages.size(); ++i)
+    {
+        written_before[i] = written_before[i - 1];
+        for (const auto & [column_name, _] : prepared_stages[i - 1].column_to_updated)
+            written_before[i].insert(column_name);
+    }
+
     /// Now, calculate the chain of actions for each stage except the first.
     /// Do it backwards to propagate information about columns required as input for a stage to the previous stage.
     for (int64_t i = prepared_stages.size() - 1; i >= 0; --i)
@@ -1973,6 +1982,7 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         /// Note: the table may not be registered if the expression doesn't
         /// reference any columns (e.g. MATERIALIZE COLUMN with a constant default).
         const auto * table_expression_data = planner_context->getTableExpressionDataOrNull(table_node);
+        NamesAndTypesList subcolumns_of_written_columns;
         if (table_expression_data)
         {
             for (const auto & selected_name : table_expression_data->getSelectedColumnsNames())
@@ -1995,6 +2005,12 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
                 auto col_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
                 if (auto column = storage_snapshot->tryGetColumn(col_options, selected_name))
                 {
+                    if (column->isSubcolumn() && written_before[i].contains(column->getNameInStorage())
+                        && input_columns_set.contains(column->getNameInStorage()))
+                    {
+                        subcolumns_of_written_columns.push_back(*column);
+                        continue;
+                    }
                     input_columns.emplace_back(column->type, column->name);
                     input_columns_set.insert(selected_name);
                 }
@@ -2008,6 +2024,24 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
 
         stage.new_actions_chain = std::make_unique<ActionsChain>();
         auto & actions_chain = *stage.new_actions_chain;
+
+        /// The first step of a stage takes a subcolumn of a column an earlier stage wrote from that column, not from the part.
+        auto make_step_dag = [&]() -> ActionsDAG
+        {
+            if (actions_chain.getStepsSize() > 0)
+                return ActionsDAG(actions_chain.getLastStepAvailableOutputColumns());
+            ActionsDAG dag(input_columns);
+            for (const auto & subcolumn : subcolumns_of_written_columns)
+            {
+                auto name_type = std::make_shared<DataTypeString>();
+                String name = subcolumn.getSubcolumnName();
+                const auto & name_node = dag.addColumn(name_type->createColumnConst(1, name), name_type, calculateConstantActionNodeName(Field(name)));
+                const auto & value = dag.addFunction(FunctionFactory::instance().get("getSubcolumn", execution_context),
+                    {&dag.findInOutputs(subcolumn.getNameInStorage()), &name_node}, {});
+                dag.getOutputs().push_back(&dag.addAlias(value, subcolumn.name));
+            }
+            return dag;
+        };
 
         /// 4. Build filter step (combine all filter expressions with AND).
         if (!stage.filters.empty())
@@ -2032,7 +2066,7 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
             }
 
             auto filter_actions = std::make_shared<ActionsAndProjectInputsFlag>();
-            filter_actions->dag = ActionsDAG(input_columns);
+            filter_actions->dag = make_step_dag();
             /// Use PlannerActionsVisitor directly instead of
             /// buildActionsDAGFromExpressionNode, because the latter
             /// replaces DAG outputs with only the expression results.
@@ -2087,10 +2121,6 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         /// 5. Build update step.
         if (!stage.column_to_updated.empty())
         {
-            auto available_columns_for_step = actions_chain.getStepsSize() > 0
-                ? actions_chain.getLastStepAvailableOutputColumns()
-                : input_columns;
-
             /// Build a combined expression list for all update expressions.
             auto update_expr_list = make_intrusive<ASTExpressionList>();
             for (const auto & kv : stage.column_to_updated)
@@ -2102,7 +2132,7 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
             collectSetsAndSourceColumns(update_tree, planner_context, true);
 
             auto update_actions = std::make_shared<ActionsAndProjectInputsFlag>();
-            update_actions->dag = ActionsDAG(available_columns_for_step);
+            update_actions->dag = make_step_dag();
             PlannerActionsVisitor update_visitor(planner_context, empty_correlated_columns, false);
             auto [update_expression_nodes, update_correlated_subtrees] = update_visitor.visit(update_actions->dag, update_tree);
             update_correlated_subtrees.assertEmpty("in mutation update");
@@ -2180,11 +2210,7 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
 
         /// 7. Build projection step - keep only output_columns.
         {
-            auto available_columns_for_proj = actions_chain.getStepsSize() > 0
-                ? actions_chain.getLastStepAvailableOutputColumns()
-                : input_columns;
-
-            ActionsDAG proj_dag(available_columns_for_proj);
+            ActionsDAG proj_dag = make_step_dag();
             ActionsDAG::NodeRawConstPtrs proj_outputs;
             /// Iterate all_columns (metadata order) for deterministic output
             /// ordering.  Consumers like EmbeddedRocksDBSink expect columns
