@@ -92,6 +92,15 @@ SYSTEM START MERGES t_two;
 ALTER TABLE t_two UPDATE y = 1 WHERE 1 SETTINGS mutations_sync = 2;
 SELECT 'materialized', id, a, tu, b, c FROM t_two ORDER BY id SETTINGS apply_mutations_on_fly = 0;
 
+SELECT 'alias column';
+DROP TABLE IF EXISTS t_alias;
+CREATE TABLE t_alias (id UInt8, a Array(UInt32), al UInt64 ALIAS a.size0, al2 UInt64 ALIAS al * 10, b UInt64, c UInt64)
+ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0;
+INSERT INTO t_alias (id, a, b, c) VALUES (1, [1, 2], 0, 0), (2, [3], 0, 0), (3, [4, 5], 0, 0);
+ALTER TABLE t_alias UPDATE a = [7, 8, 9] WHERE id = 1, UPDATE b = al, c = al2 WHERE 1, DELETE WHERE al = 2
+    SETTINGS mutations_sync = 2;
+SELECT id, a, al, b, c FROM t_alias ORDER BY id;
+
 SELECT 'memory engine';
 DROP TABLE IF EXISTS t_memory;
 CREATE TABLE t_memory (id UInt8, a Array(UInt32), b UInt64) ENGINE = Memory;
@@ -106,4 +115,5 @@ DROP TABLE t_stage;
 DROP TABLE t_materialized;
 DROP TABLE t_order;
 DROP TABLE t_two;
+DROP TABLE t_alias;
 DROP TABLE t_memory;

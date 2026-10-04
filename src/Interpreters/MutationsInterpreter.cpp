@@ -1982,9 +1982,27 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         NamesAndTypesList subcolumns_of_written_columns;
         if (table_expression_data)
         {
+            /// Includes the sources of ALIAS expressions, which are read but not selected.
+            NameSet derived_subcolumns;
+            auto read_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
+            for (const auto & column_name : table_expression_data->getColumnNames())
+            {
+                if (input_columns_set.contains(column_name))
+                    continue;
+                auto column = storage_snapshot->tryGetColumn(read_options, column_name);
+                if (!column || !column->isSubcolumn() || !input_columns_set.contains(column->getNameInStorage()))
+                    continue;
+                auto writer = first_writing_stage.find(column->getNameInStorage());
+                if (writer != first_writing_stage.end() && writer->second < static_cast<size_t>(i))
+                {
+                    subcolumns_of_written_columns.push_back(*column);
+                    derived_subcolumns.insert(column_name);
+                }
+            }
+
             for (const auto & selected_name : table_expression_data->getSelectedColumnsNames())
             {
-                if (input_columns_set.contains(selected_name))
+                if (input_columns_set.contains(selected_name) || derived_subcolumns.contains(selected_name))
                     continue;
 
                 /// Virtual column (e.g. `_part`, `_partition_id`).
@@ -2002,15 +2020,6 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
                 auto col_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
                 if (auto column = storage_snapshot->tryGetColumn(col_options, selected_name))
                 {
-                    if (column->isSubcolumn() && input_columns_set.contains(column->getNameInStorage()))
-                    {
-                        auto writer = first_writing_stage.find(column->getNameInStorage());
-                        if (writer != first_writing_stage.end() && writer->second < static_cast<size_t>(i))
-                        {
-                            subcolumns_of_written_columns.push_back(*column);
-                            continue;
-                        }
-                    }
                     input_columns.emplace_back(column->type, column->name);
                     input_columns_set.insert(selected_name);
                 }
