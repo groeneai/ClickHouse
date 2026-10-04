@@ -1,6 +1,8 @@
 #include <Interpreters/InterpreterHypotheticalObjectQuery.h>
 
 #include <Access/Common/AccessFlags.h>
+#include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
+#include <Functions/UserDefined/UserDefinedSQLFunctionVisitor.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -116,7 +118,11 @@ BlockIO createHypotheticalIndex(
         /* is_implicitly_created = */ false,
         /* escape_filenames = */ true,
         context);
-    IndexDescription::checkAliasesNotCapturedByLambda(query.index_decl, metadata->getColumns());
+    /// CREATE and ALTER check the declaration after SQL UDFs are inlined.
+    ASTPtr checked_declaration = query.index_decl->clone();
+    if (!UserDefinedSQLFunctionFactory::instance().empty())
+        UserDefinedSQLFunctionVisitor::visit(checked_declaration, context);
+    IndexDescription::checkAliasesNotCapturedByLambda(checked_declaration, metadata->getColumns());
 
     /// Empirical estimation reads the index's columns, so require column-level
     /// SELECT — otherwise a user with table-level access could infer a restricted

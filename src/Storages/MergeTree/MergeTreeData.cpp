@@ -6744,7 +6744,12 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
             auto failure = tryCheckAliasesNotCapturedByLambda(index, new_metadata.columns);
             if (!failure)
                 continue;
-            const bool inherited = old_metadata.secondary_indices.has(index.name)
+            const bool redeclared = std::ranges::any_of(commands, [&](const AlterCommand & command)
+            {
+                return command.type == AlterCommand::DROP_INDEX && !command.clear && !command.partition
+                    && command.index_name == index.name;
+            });
+            const bool inherited = !redeclared && old_metadata.secondary_indices.has(index.name)
                 && tryCheckAliasesNotCapturedByLambda(old_metadata.secondary_indices.getByName(index.name), old_metadata.columns);
             if (!inherited)
                 std::rethrow_exception(failure);

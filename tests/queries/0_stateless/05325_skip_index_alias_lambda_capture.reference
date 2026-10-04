@@ -16,6 +16,8 @@ i4	arrayMax(arrayMap(k -> arrayMax(arrayMap(k -> (k + 1), arr)), arr))
 1
 1
 1
+1
+1
 i	arrayMax(arrayMap(k2 -> 1, arr))
 j	arrayMax(arrayMap(x -> (k2 + 1), arr))
 n	arrayMax(arrayMap(x -> (k2 + 1), arr))
@@ -26,6 +28,7 @@ arrayMax(arrayMap(k -> (k + 1), arr))
 6	7
 i	arrayMax(arrayMap(k -> (k + 1), arr))
 j	arrayMax(arrayMap(x -> (k + 1), arr))
+1
 1
 1
 1

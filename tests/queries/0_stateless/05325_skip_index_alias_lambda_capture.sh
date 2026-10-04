@@ -55,6 +55,11 @@ ENGINE = MergeTree ORDER BY tuple()"
 rejected "ALTER TABLE t_alter ADD INDEX n arrayMax(arrayMap(k -> e, arr)) TYPE minmax"
 rejected "CREATE INDEX n ON t_alter (arrayMax(arrayMap(k -> e, arr))) TYPE minmax"
 rejected "CREATE HYPOTHETICAL INDEX n ON t_alter (arrayMax(arrayMap(k -> e, arr))) TYPE minmax"
+$CLICKHOUSE_CLIENT --query "CREATE FUNCTION ${CLICKHOUSE_DATABASE}_amap AS (x, xs) -> arrayMax(arrayMap(k -> x, xs))"
+rejected "ALTER TABLE t_alter ADD INDEX n ${CLICKHOUSE_DATABASE}_amap(e, arr) TYPE minmax"
+rejected "CREATE HYPOTHETICAL INDEX n ON t_alter (${CLICKHOUSE_DATABASE}_amap(e, arr)) TYPE minmax"
+$CLICKHOUSE_CLIENT --query "CREATE HYPOTHETICAL INDEX h ON t_alter (${CLICKHOUSE_DATABASE}_amap(d, arr)) TYPE minmax"
+$CLICKHOUSE_CLIENT --query "DROP FUNCTION ${CLICKHOUSE_DATABASE}_amap"
 rejected "ALTER TABLE t_alter MODIFY COLUMN d UInt32 ALIAS k + 1"
 rejected "ALTER TABLE t_alter RENAME COLUMN k TO x"
 $CLICKHOUSE_CLIENT --query "
@@ -87,6 +92,7 @@ SELECT expr FROM system.data_skipping_indices WHERE database = 'db' AND table = 
 INSERT INTO db.t VALUES (5, [100]);
 INSERT INTO db.t VALUES (6, [100]);
 OPTIMIZE TABLE db.t FINAL;
+ALTER TABLE db.t CLEAR INDEX i SETTINGS mutations_sync = 2;
 ALTER TABLE db.t MATERIALIZE INDEX i SETTINGS mutations_sync = 2;
 ALTER TABLE db.t ADD COLUMN z UInt8;
 ALTER TABLE db.t ADD INDEX j arrayMax(arrayMap(x -> d, arr)) TYPE minmax;
@@ -96,6 +102,7 @@ SELECT k, arrayMax(arrayMap(k -> d, arr)) FROM db.t ORDER BY k;
 SELECT name, expr FROM system.data_skipping_indices WHERE database = 'db' AND table = 't' AND creation = 'Explicit' ORDER BY name;
 "
 
+rejected_local "ALTER TABLE db.t DROP INDEX i, ADD INDEX i arrayMax(arrayMap(k -> d, arr)) TYPE minmax"
 rejected_local "ALTER TABLE db.t ADD INDEX n arrayMin(arrayMap(k -> d, arr)) TYPE minmax"
 rejected_local "CREATE TABLE db.t2 AS db.t"
 rejected_local "ATTACH TABLE db.t3 UUID '05325000-0000-0000-0000-000000000003' (k UInt32, arr Array(UInt32), d UInt32 ALIAS k + 1,
