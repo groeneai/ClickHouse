@@ -1912,14 +1912,11 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         }
     }
 
-    /// Columns written by the stages before the i-th one.
-    std::vector<NameSet> written_before(prepared_stages.size());
-    for (size_t i = 1; i < prepared_stages.size(); ++i)
-    {
-        written_before[i] = written_before[i - 1];
-        for (const auto & [column_name, _] : prepared_stages[i - 1].column_to_updated)
-            written_before[i].insert(column_name);
-    }
+    /// The first stage that writes each column.
+    std::unordered_map<String, size_t> first_writing_stage;
+    for (size_t i = 0; i < prepared_stages.size(); ++i)
+        for (const auto & [column_name, _] : prepared_stages[i].column_to_updated)
+            first_writing_stage.try_emplace(column_name, i);
 
     /// Now, calculate the chain of actions for each stage except the first.
     /// Do it backwards to propagate information about columns required as input for a stage to the previous stage.
@@ -2005,11 +2002,14 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
                 auto col_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
                 if (auto column = storage_snapshot->tryGetColumn(col_options, selected_name))
                 {
-                    if (column->isSubcolumn() && written_before[i].contains(column->getNameInStorage())
-                        && input_columns_set.contains(column->getNameInStorage()))
+                    if (column->isSubcolumn() && input_columns_set.contains(column->getNameInStorage()))
                     {
-                        subcolumns_of_written_columns.push_back(*column);
-                        continue;
+                        auto writer = first_writing_stage.find(column->getNameInStorage());
+                        if (writer != first_writing_stage.end() && writer->second < static_cast<size_t>(i))
+                        {
+                            subcolumns_of_written_columns.push_back(*column);
+                            continue;
+                        }
                     }
                     input_columns.emplace_back(column->type, column->name);
                     input_columns_set.insert(selected_name);
