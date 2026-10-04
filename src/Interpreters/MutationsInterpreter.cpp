@@ -1912,7 +1912,6 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         }
     }
 
-    /// The first stage that writes each column.
     std::unordered_map<String, size_t> first_writing_stage;
     for (size_t i = 0; i < prepared_stages.size(); ++i)
         for (const auto & [column_name, _] : prepared_stages[i].column_to_updated)
@@ -2033,7 +2032,7 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         stage.new_actions_chain = std::make_unique<ActionsChain>();
         auto & actions_chain = *stage.new_actions_chain;
 
-        /// The first step of a stage takes a subcolumn of a column an earlier stage wrote from that column, not from the part.
+        /// A subcolumn of a column an earlier stage wrote is computed from that column, not read from the part.
         auto make_step_dag = [&]() -> ActionsDAG
         {
             if (actions_chain.getStepsSize() > 0)
