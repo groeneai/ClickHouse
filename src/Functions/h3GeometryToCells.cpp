@@ -6,6 +6,9 @@
 #include <Common/VectorWithMemoryTracking.h>
 #include <IO/WriteHelpers.h>
 
+#include <algorithm>
+#include <array>
+
 #include <constants.h>
 #include <h3api.h>
 /// H3's polygon internals: private to the library, and not declared for C++. The candidate walk below
@@ -39,6 +42,7 @@ namespace
 constexpr double MAX_SIZE_CELL_THRESHOLD = 10;
 /// The coordinate range `latLngToCell` accepts, `VALID_RANGE_BBOX` in H3's `polyfill.c`.
 constexpr BBox VALID_RANGE_BBOX = {M_PI_2, -M_PI_2, M_PI, -M_PI};
+constexpr double MAX_FAST_PATH_LATITUDE = 85 * M_PI / 180;
 
 SphericalPointInRadians toRadianPoint(const SphericalPoint & degree_point)
 {
@@ -301,6 +305,97 @@ Int64 estimateCellCount(
     return estimate;
 }
 
+/// `_hexRadiusKm` of the first pentagon in H3's `bbox.c`: `lineHexEstimate` samples an edge every twice this
+/// distance. Keep in sync with H3 when the submodule is bumped.
+double pentagonRadiusKm(int res, std::string_view function_name)
+{
+    static const std::array<double, MAX_H3_RES + 1> radii = [&]
+    {
+        std::array<double, MAX_H3_RES + 1> result{};
+        for (int r = 0; r <= MAX_H3_RES; ++r)
+        {
+            std::array<H3Index, 12> pentagons{};
+            checkH3Error(getPentagons(r, pentagons.data()), function_name);
+            LatLng center;
+            checkH3Error(cellToLatLng(pentagons[0], &center), function_name);
+            CellBoundary boundary;
+            checkH3Error(cellToBoundary(pentagons[0], &boundary), function_name);
+            result[r] = greatCircleDistanceKm(&center, &boundary.verts[0]);
+        }
+        return result;
+    }();
+    return radii[res];
+}
+
+/// Appends the cells of a small hole-free polygon using H3's `polygonToCells` instead of the walk. Returns false,
+/// having appended nothing, when the work bound below does not hold or `polygonToCells` cannot handle the polygon.
+bool tryAppendSmallPolygonCells(
+    const GeoPolygon * polygon,
+    const VectorWithMemoryTracking<BBox> & bboxes,
+    int res,
+    size_t vertex_count,
+    size_t row_start_offset,
+    std::string_view function_name,
+    CancellationBudget & budget,
+    ColumnUInt64 & dst_data)
+{
+    const BBox & bbox = bboxes[0];
+    if (polygon->geoloop.numVerts == 0 || polygon->numHoles != 0 || bboxIsTransmeridian(&bbox)
+        || bbox.east - bbox.west > M_PI || std::max(std::abs(bbox.north), std::abs(bbox.south)) > MAX_FAST_PATH_LATITUDE
+        || vertex_count > 4 * (static_cast<size_t>(res) + 2))
+        return false;
+
+    constexpr size_t max_units = CancellationBudget::units_per_check;
+    int64_t size = 0;
+    const H3Error size_error = maxPolygonToCellsSize(polygon, res, CONTAINMENT_CENTER, &size);
+    if (size_error == E_FAILED)
+        return false;
+    checkH3Error(size_error, function_name);
+    if (size <= 0 || static_cast<size_t>(size) > max_units)
+        return false;
+    const size_t cells_bound = static_cast<size_t>(size);
+
+    const double sample_spacing_km = 2 * pentagonRadiusKm(res, function_name);
+    const GeoLoop & loop = polygon->geoloop;
+    size_t edge_samples = 0;
+    for (int i = 0; i < loop.numVerts; ++i)
+    {
+        const LatLng & to = loop.verts[i + 1 == loop.numVerts ? 0 : i + 1];
+        const double samples = std::ceil(greatCircleDistanceKm(&loop.verts[i], &to) / sample_spacing_km);
+        if (!(samples <= static_cast<double>(max_units))) /// Also NaN.
+            return false;
+        edge_samples += std::max<size_t>(1, static_cast<size_t>(samples));
+    }
+    if (edge_samples > max_units)
+        return false;
+
+    /// An upper bound on the hash probes and point-in-polygon edge steps of `polygonToCells`, so that it never
+    /// runs for more than one checkpoint interval.
+    const size_t units = edge_samples * (cells_bound + 1) + 16 * cells_bound * (cells_bound + 2 + vertex_count);
+    if (units > max_units)
+        return false;
+    budget.chargeUnits(units);
+
+    VectorWithMemoryTracking<H3Index> cells(cells_bound, H3_NULL);
+    const H3Error fill_error = polygonToCells(polygon, res, CONTAINMENT_CENTER, cells.data());
+    if (fill_error == E_FAILED)
+        return false;
+    checkH3Error(fill_error, function_name);
+
+    /// The walk returns cells in ascending order.
+    std::erase(cells, H3_NULL);
+    std::sort(cells.begin(), cells.end());
+
+    const size_t row_size = dst_data.size() - row_start_offset + cells.size();
+    if (row_size > MAX_ARRAY_SIZE)
+        throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE,
+            "The result of function {} (array of {} elements) will be too large with resolution = {}",
+            function_name, row_size, toString(res));
+
+    dst_data.getData().insert(cells.begin(), cells.end());
+    return true;
+}
+
 LatLng toH3LatLng(const SphericalPointInRadians & point)
 {
     LatLng result;
@@ -388,6 +483,10 @@ void appendH3Cells(
         /// Bounding boxes of the polygon and of each of its holes, which every candidate check needs.
         VectorWithMemoryTracking<BBox> bboxes(geo_polygon->numHoles + 1);
         bboxesFromGeoPolygon(geo_polygon, bboxes.data());
+
+        if (flags == CONTAINMENT_CENTER
+            && tryAppendSmallPolygonCells(geo_polygon, bboxes, resolution, vertex_count, row_start_offset, function_name, budget, dst_data))
+            continue;
 
         /// A candidate at the target resolution is tested against every vertex of the polygon.
         const size_t units_per_candidate = 1 + vertex_count;
