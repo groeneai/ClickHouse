@@ -1120,6 +1120,19 @@ static std::exception_ptr tryEvaluateIndexExpression(const IndexDescription & in
     return {};
 }
 
+static std::exception_ptr tryCheckAliasesNotCapturedByLambda(const IndexDescription & index, const ColumnsDescription & columns)
+{
+    try
+    {
+        IndexDescription::checkAliasesNotCapturedByLambda(index.definition_ast, columns);
+    }
+    catch (...)
+    {
+        return std::current_exception();
+    }
+    return {};
+}
+
 void MergeTreeData::checkProperties(
     const StorageInMemoryMetadata & new_metadata,
     const StorageInMemoryMetadata & old_metadata,
@@ -6722,6 +6735,21 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
     checkTTLExpressions(new_metadata, old_metadata);
     if (!is_secondary_replay)
         checkColumnTTLsForKeyColumns(new_metadata, old_metadata);
+
+    /// An index an older server stored with such an expression is kept while the ALTER leaves it so.
+    if (!is_secondary_replay)
+    {
+        for (const auto & index : new_metadata.secondary_indices)
+        {
+            auto failure = tryCheckAliasesNotCapturedByLambda(index, new_metadata.columns);
+            if (!failure)
+                continue;
+            const bool inherited = old_metadata.secondary_indices.has(index.name)
+                && tryCheckAliasesNotCapturedByLambda(old_metadata.secondary_indices.getByName(index.name), old_metadata.columns);
+            if (!inherited)
+                std::rethrow_exception(failure);
+        }
+    }
 
     if (!columns_to_check_conversion.empty())
     {

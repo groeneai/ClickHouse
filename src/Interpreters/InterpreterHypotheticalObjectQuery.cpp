@@ -116,6 +116,7 @@ BlockIO createHypotheticalIndex(
         /* is_implicitly_created = */ false,
         /* escape_filenames = */ true,
         context);
+    IndexDescription::checkAliasesNotCapturedByLambda(query.index_decl, metadata->getColumns());
 
     /// Empirical estimation reads the index's columns, so require column-level
     /// SELECT — otherwise a user with table-level access could infer a restricted

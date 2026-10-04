@@ -68,6 +68,10 @@ struct IndexDescription
         bool escape_filenames,
         ContextPtr context);
 
+    /// Throws BAD_ARGUMENTS if an ALIAS column used inside a lambda of the index expression would, once inlined,
+    /// read a name the lambda binds instead of the table column.
+    static void checkAliasesNotCapturedByLambda(const ASTPtr & definition_ast, const ColumnsDescription & columns);
+
     IndexDescription() = default;
 
     /// We need custom copy constructors because we don't want
