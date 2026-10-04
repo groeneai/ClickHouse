@@ -32,7 +32,7 @@ echo "-- A comment the SQL lexer reads as an unclosed string, at EOF"
 $CLICKHOUSE_CLIENT --allow_experimental_time_series_table 1 --dialect promql --promql_table ts --promql_evaluation_time 1700000000 --query $'up #don\'t' 2>&1 | cut -f1,3
 
 echo "-- A semicolon in a comment at EOF does not end the statement"
-$CLICKHOUSE_CLIENT --allow_experimental_time_series_table 1 --dialect promql --promql_table ts --promql_evaluation_time 1700000000 -m --query $'up{instance="host1"}; sum(up) #a ; b' 2>&1 | cut -f1,3
+$CLICKHOUSE_CLIENT --allow_experimental_time_series_table 1 --dialect promql --promql_table ts --promql_evaluation_time 1700000000 -m --query $'up{instance="host1"}; sum(up) #a ; up' 2>&1 | cut -f1,3
 
 echo "-- A bare CR ends a PromQL comment, so the next statement is not swallowed"
 $CLICKHOUSE_CLIENT --allow_experimental_time_series_table 1 --dialect promql --promql_table ts --promql_evaluation_time 1700000000 -m --query $'up #comment\r; SET dialect = \'clickhouse\'; SELECT \'next statement\'' | cut -f1,3
