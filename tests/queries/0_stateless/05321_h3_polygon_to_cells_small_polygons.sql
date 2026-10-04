@@ -1,6 +1,7 @@
 -- Tags: no-fasttest
 
--- The cells of a polygon, and their order, do not depend on how many collinear vertices describe it:
+-- The cells of a polygon, and their order, do not depend on how many collinear vertices describe it, with
+-- `h3PolygonToCells` and with `h3PolygonToCellsWithContainment` in mode 0:
 -- `split` divides every edge into 64 equal pieces. Coordinates are multiples of 2^-20 degrees, so the
 -- new vertices lie exactly on the original edges.
 
@@ -21,7 +22,7 @@ FROM
     UNION ALL SELECT 'one_vertex', [[[(-0.4, 51.4)]]], [10]
 );
 
-SELECT name, r, h3PolygonToCells(mp, r) = h3PolygonToCells(split, r) AS same, length(h3PolygonToCells(mp, r)) AS cells
+SELECT name, r, h3PolygonToCells(mp, r) = h3PolygonToCells(split, r) AS same, h3PolygonToCellsWithContainment(mp, r, 0) = h3PolygonToCells(split, r) AS same_mode_0, length(h3PolygonToCells(mp, r)) AS cells
 FROM
 (
     SELECT
@@ -36,7 +37,7 @@ FROM
 ORDER BY name, r;
 
 -- The same ring passed as a `Ring`.
-SELECT r, h3PolygonToCells(mp[1][1], r) = h3PolygonToCells(split[1][1], r) AS same, length(h3PolygonToCells(mp[1][1], r)) AS cells
+SELECT r, h3PolygonToCells(mp[1][1], r) = h3PolygonToCells(split[1][1], r) AS same, h3PolygonToCellsWithContainment(mp[1][1], r, 0) = h3PolygonToCells(split[1][1], r) AS same_mode_0, length(h3PolygonToCells(mp[1][1], r)) AS cells
 FROM
 (
     SELECT
