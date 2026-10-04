@@ -421,14 +421,20 @@ MoveDirectoryOperation::MoveDirectoryOperation(std::string path_from_, std::stri
 
 void MoveDirectoryOperation::execute()
 {
+    const bool destination_existed = disk.existsDirectory(path_to);
     disk.moveDirectory(path_from, path_to);
     moved = true;
+    replaced_destination = destination_existed;
 }
 
 void MoveDirectoryOperation::undo()
 {
-    if (moved)
-        disk.moveDirectory(path_to, path_from);
+    if (!moved)
+        return;
+
+    disk.moveDirectory(path_to, path_from);
+    if (replaced_destination)
+        disk.createDirectory(path_to);
 }
 
 ReplaceFileOperation::ReplaceFileOperation(std::string path_from_, std::string path_to_, const std::string & compatible_key_prefix_, IDisk & disk_, StoredObjects & objects_to_remove_)

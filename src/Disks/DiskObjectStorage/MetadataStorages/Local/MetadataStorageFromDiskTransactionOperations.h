@@ -200,6 +200,8 @@ private:
     IDisk & disk;
 
     bool moved = false;
+    /// The rename replaced an empty directory at `path_to`.
+    bool replaced_destination = false;
 };
 
 struct ReplaceFileOperation final : public IMetadataOperation

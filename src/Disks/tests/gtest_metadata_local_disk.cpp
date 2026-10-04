@@ -1800,6 +1800,24 @@ TEST_F(MetadataLocalDiskTest, TestRollbackUndoesOnlyWhatAFailedOperationDid)
             .check = [&](const Metadata & metadata) { expect_blob(metadata, "md/f"); EXPECT_FALSE(metadata->existsDirectory("md2")); },
         },
         {
+            .name = "move a directory onto an empty one",
+            .setup = [&](const Metadata & metadata)
+            {
+                auto tx = metadata->createTransaction();
+                tx->createDirectory("ex");
+                tx->createDirectory("ey");
+                tx->commit(DB::NoCommitOptions{});
+                create_files(metadata, {"ex/f"});
+            },
+            .operation = [](Transaction & tx) { tx.moveDirectory("ex", "ey"); },
+            .check = [&](const Metadata & metadata)
+            {
+                expect_blob(metadata, "ex/f");
+                ASSERT_TRUE(metadata->existsDirectory("ey"));
+                EXPECT_TRUE(metadata->listDirectory("ey").empty());
+            },
+        },
+        {
             .name = "create a directory",
             .operation = [](Transaction & tx) { tx.createDirectory("nd"); },
             .check = [&](const Metadata & metadata) { EXPECT_FALSE(metadata->existsDirectory("nd")); },
