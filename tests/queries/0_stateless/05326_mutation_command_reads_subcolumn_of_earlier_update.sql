@@ -101,6 +101,19 @@ ALTER TABLE t_alias UPDATE a = [7, 8, 9] WHERE id = 1, UPDATE b = al, c = al2 WH
     SETTINGS mutations_sync = 2;
 SELECT id, a, al, b, c FROM t_alias ORDER BY id;
 
+SELECT 'unusual column names';
+DROP TABLE IF EXISTS t_names;
+CREATE TABLE t_names (id UInt8, a Array(UInt32), `'size0'_String` UInt64, b UInt64) ENGINE = MergeTree ORDER BY id;
+INSERT INTO t_names VALUES (1, [1, 2], 100, 0), (2, [3], 100, 0);
+ALTER TABLE t_names UPDATE a = [7, 8, 9] WHERE id = 1, UPDATE b = `'size0'_String` + a.size0 WHERE 1 SETTINGS mutations_sync = 2;
+SELECT id, a, b FROM t_names ORDER BY id;
+DROP TABLE IF EXISTS t_names2;
+CREATE TABLE t_names2 (id UInt8, a Array(UInt32), `getSubcolumn(a, 'size0'_String)` UInt64, b UInt64) ENGINE = MergeTree ORDER BY id;
+INSERT INTO t_names2 VALUES (1, [1, 2], 200, 0), (2, [3], 200, 0);
+ALTER TABLE t_names2 UPDATE a = [7, 8, 9] WHERE id = 1, UPDATE b = `getSubcolumn(a, 'size0'_String)` + a.size0 WHERE 1
+    SETTINGS mutations_sync = 2;
+SELECT id, a, b FROM t_names2 ORDER BY id;
+
 SELECT 'memory engine';
 DROP TABLE IF EXISTS t_memory;
 CREATE TABLE t_memory (id UInt8, a Array(UInt32), b UInt64) ENGINE = Memory;
@@ -116,4 +129,6 @@ DROP TABLE t_materialized;
 DROP TABLE t_order;
 DROP TABLE t_two;
 DROP TABLE t_alias;
+DROP TABLE t_names;
+DROP TABLE t_names2;
 DROP TABLE t_memory;

@@ -1984,12 +1984,12 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
         {
             /// Includes the sources of ALIAS expressions, which are read but not selected.
             NameSet derived_subcolumns;
-            auto read_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
+            auto col_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
             for (const auto & column_name : table_expression_data->getColumnNames())
             {
                 if (input_columns_set.contains(column_name))
                     continue;
-                auto column = storage_snapshot->tryGetColumn(read_options, column_name);
+                auto column = storage_snapshot->tryGetColumn(col_options, column_name);
                 if (!column || !column->isSubcolumn() || !input_columns_set.contains(column->getNameInStorage()))
                     continue;
                 auto writer = first_writing_stage.find(column->getNameInStorage());
@@ -2017,7 +2017,6 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
                 /// Subcolumn (e.g. `json.a` for a JSON/Dynamic parent column).
                 /// The read infrastructure (MergeTreeSequentialSource, IMergeTreeReader)
                 /// already supports reading subcolumns transparently.
-                auto col_options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
                 if (auto column = storage_snapshot->tryGetColumn(col_options, selected_name))
                 {
                     input_columns.emplace_back(column->type, column->name);
@@ -2044,10 +2043,15 @@ void MutationsInterpreter::prepareMutationStages(std::vector<Stage> & prepared_s
             {
                 auto name_type = std::make_shared<DataTypeString>();
                 String name = subcolumn.getSubcolumnName();
-                const auto & name_node = dag.addColumn(name_type->createColumnConst(1, name), name_type, calculateConstantActionNodeName(Field(name)));
+                /// The actions visitor resolves a name to the last node that has it,
+                /// so the literal must not take the name of a column the stage reads.
+                String name_node_name = calculateConstantActionNodeName(Field(name));
+                while (table_expression_data->hasColumn(name_node_name))
+                    name_node_name = "_" + name_node_name;
+                const auto & name_node = dag.addColumn(name_type->createColumnConst(1, name), name_type, name_node_name);
                 const auto & value = dag.addFunction(FunctionFactory::instance().get("getSubcolumn", execution_context),
-                    {&dag.findInOutputs(subcolumn.getNameInStorage()), &name_node}, {});
-                dag.getOutputs().push_back(&dag.addAlias(value, subcolumn.name));
+                    {&dag.findInOutputs(subcolumn.getNameInStorage()), &name_node}, subcolumn.name);
+                dag.getOutputs().push_back(&value);
             }
             return dag;
         };
