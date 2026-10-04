@@ -21,7 +21,7 @@ CREATE TABLE t_kinds
     k1 UInt64, k2 UInt64, k3 UInt8, k4 UInt64, k5 Nullable(UInt32), k6 String, k7 Nullable(UInt64), k8 UInt64,
     c1 UInt64, c2 UInt64, c3 UInt8
 )
-ENGINE = MergeTree ORDER BY id;
+ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0;
 INSERT INTO t_kinds (id, a, tu, x, mp, v, j, d, `n.e`, `n.f`) VALUES
     (1, [1, 2], (1, 2), NULL, map('a', 1), 's', '{"f":1}', 's', [1], [2]),
     (2, [3], (3, 4), 5, map('b', 2, 'c', 3), 5::UInt32, '{"f":3}', 5::UInt64, [3, 4], [5, 6]);
@@ -32,6 +32,7 @@ ALTER TABLE t_kinds
         k8 = n.e.size0, c1 = length(a), c2 = tupleElement(tu, 'p'), c3 = isNull(x) WHERE 1
     SETTINGS mutations_sync = 2;
 SELECT id, k1, k2, k3, k4, k5, k6, k7, k8, c1, c2, c3 FROM t_kinds ORDER BY id;
+SELECT DISTINCT part_type FROM system.parts WHERE database = currentDatabase() AND table = 't_kinds' AND active;
 
 SELECT 'compact part';
 DROP TABLE IF EXISTS t_compact;
@@ -40,14 +41,23 @@ ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = '10G', min_row
 INSERT INTO t_compact VALUES (1, [1, 2], (1, 2), 0, 0), (2, [3], (3, 4), 0, 0);
 ALTER TABLE t_compact UPDATE a = [7, 8, 9], tu = (10, 20) WHERE id = 1, UPDATE b = a.size0, c = tu.p WHERE 1 SETTINGS mutations_sync = 2;
 SELECT id, b, c FROM t_compact ORDER BY id;
+SELECT DISTINCT part_type FROM system.parts WHERE database = currentDatabase() AND table = 't_compact' AND active;
 
 SELECT 'predicates';
 DROP TABLE IF EXISTS t_predicates;
-CREATE TABLE t_predicates (id UInt8, a Array(UInt32), b UInt64) ENGINE = MergeTree ORDER BY id;
+CREATE TABLE t_predicates (id UInt8, a Array(UInt32), b UInt64) ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0;
 INSERT INTO t_predicates VALUES (1, [1, 2], 0), (2, [3], 0), (3, [4, 5], 0);
 ALTER TABLE t_predicates UPDATE a = [7, 8, 9] WHERE id = 1, UPDATE b = 1 WHERE a.size0 = 3, UPDATE a = [1, 1, 1] WHERE id = 3, DELETE WHERE a.size0 = 2
     SETTINGS mutations_sync = 2;
 SELECT id, a, b FROM t_predicates ORDER BY id;
+
+SELECT 'delete and update in one stage';
+DROP TABLE IF EXISTS t_stage;
+CREATE TABLE t_stage (id UInt8, a Array(UInt32), b UInt64) ENGINE = MergeTree ORDER BY id;
+INSERT INTO t_stage VALUES (1, [1, 2], 0), (2, [3], 0), (3, [4, 5], 0);
+ALTER TABLE t_stage UPDATE a = [7, 8, 9] WHERE id = 1, DELETE WHERE a.size0 = 2, UPDATE b = a.size0 WHERE 1
+    SETTINGS mutations_sync = 2;
+SELECT id, a, b FROM t_stage ORDER BY id;
 
 SELECT 'materialized dependent';
 DROP TABLE IF EXISTS t_materialized;
@@ -72,7 +82,7 @@ SELECT id, a, b, c, e, f FROM t_order ORDER BY id;
 
 SELECT 'two mutations';
 DROP TABLE IF EXISTS t_two;
-CREATE TABLE t_two (id UInt8, a Array(UInt32), tu Tuple(p UInt32, q UInt32), b UInt64, c UInt64, y UInt8) ENGINE = MergeTree ORDER BY id;
+CREATE TABLE t_two (id UInt8, a Array(UInt32), tu Tuple(p UInt32, q UInt32), b UInt64, c UInt64, y UInt8) ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0;
 INSERT INTO t_two VALUES (1, [1, 2], (1, 2), 0, 0, 0), (2, [3], (3, 4), 0, 0, 0);
 SYSTEM STOP MERGES t_two;
 ALTER TABLE t_two UPDATE a = [7, 8, 9], tu = (10, 20) WHERE id = 1 SETTINGS mutations_sync = 0;
@@ -92,6 +102,7 @@ SELECT id, a, b FROM t_memory ORDER BY id;
 DROP TABLE t_kinds;
 DROP TABLE t_compact;
 DROP TABLE t_predicates;
+DROP TABLE t_stage;
 DROP TABLE t_materialized;
 DROP TABLE t_order;
 DROP TABLE t_two;

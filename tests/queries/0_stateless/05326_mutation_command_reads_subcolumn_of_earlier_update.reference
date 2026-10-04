@@ -1,13 +1,18 @@
 subcolumn kinds
 1	3	10	0	3	7	10	7	3	3	10	0
 2	1	3	0	2	5	3	5	2	1	3	0
+Wide
 compact part
 1	3	10
 2	1	3
+Compact
 predicates
 1	[7,8,9]	1
 2	[3]	0
 3	[1,1,1]	0
+delete and update in one stage
+1	[7,8,9]	3
+2	[3]	1
 materialized dependent
 1	[7,8,9]	3
 2	[3]	1
