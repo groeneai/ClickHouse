@@ -1785,6 +1785,11 @@ TEST(PromQLParser, LineComments)
              "up # comment\r",
              "up # comment\r\n",
              "up #!comment",
+             "up #comment",
+             "up#comment",
+             "up #",
+             "up #\n",
+             "up #comment\n",
          })
         EXPECT_NO_THROW(PrometheusQueryTree{query}) << query;
 
@@ -1794,15 +1799,6 @@ TEST(PromQLParser, LineComments)
 
     EXPECT_FALSE(query_tree.tryParse("# comment", 3, &error_message, &error_pos));
     EXPECT_EQ(error_pos, 9);
-
-    /// EOF comments use the same `# ` / `#!` prefix contract as the shared SQL lexer.
-    for (const auto * const query : {"up #", "up #comment"})
-    {
-        error_message.clear();
-        error_pos = String::npos;
-        EXPECT_FALSE(query_tree.tryParse(query, 0, &error_message, &error_pos)) << query;
-        EXPECT_EQ(error_pos, 3) << query;
-    }
 }
 
 

@@ -1,10 +1,22 @@
 -- PromQL line comments may end at EOF
--- EOF comments must match the shared SQL lexer prefix contract
-CANNOT_PARSE_PROMQL_QUERY
-CANNOT_PARSE_PROMQL_QUERY
--- A bare '#' at EOF is an error in both PromQL entry points
-CANNOT_PARSE_PROMQL_QUERY
-CANNOT_PARSE_PROMQL_QUERY
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+-- The text after '#' needs no space
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+-- A bare '#' at EOF is an empty comment
+[('__name__','up'),('instance','host1')]	30
+[('__name__','up'),('instance','host1')]	30
+-- A comment the SQL lexer reads as an unclosed string, at EOF
+[('__name__','up'),('instance','host1')]	30
+-- A semicolon in a comment at EOF does not end the statement
+[('__name__','up'),('instance','host1')]	30
+[]	30
 -- A bare CR ends a PromQL comment, so the next statement is not swallowed
+[('__name__','up'),('instance','host1')]	30
 next statement
 Cannot find the end of the PromQL statement
