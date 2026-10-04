@@ -22,9 +22,6 @@ extern const int FS_METADATA_ERROR;
 
 void MetadataOperationsHolder::rollback(size_t until_pos, Exception & rollback_reason) noexcept
 {
-    /// Neither the memory limit nor its fault injection can stop a reversal.
-    LockMemoryExceptionInThread lock_memory_exception(VariableContext::Global);
-
     ProfileEvents::increment(ProfileEvents::MetadataTransactionRollbacks);
 
     for (int64_t i = until_pos; i >= 0; --i)
@@ -91,6 +88,9 @@ void MetadataOperationsHolder::commit()
         }
         catch (Exception & error)
         {
+            /// Neither the memory limit nor its fault injection can stop the rollback.
+            LockMemoryExceptionInThread lock_memory_exception(VariableContext::Global);
+
             state = MetadataStorageTransactionState::FAILED;
 
             error.addMessage(fmt::format("While committing metadata operation #{}", i));

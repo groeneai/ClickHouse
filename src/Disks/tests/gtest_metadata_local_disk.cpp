@@ -1612,34 +1612,6 @@ TEST_F(MetadataLocalDiskTest, TestRollbackIsNotStoppedByMemoryLimit)
     }
 }
 
-/// A step of a rollback that fails is repeated until it succeeds.
-TEST_F(MetadataLocalDiskTest, TestRollbackRepeatsAFailedUndoStep)
-{
-    auto [metadata, disk] = getFaultInjectingMetadataStorage("/TestRollbackRepeatsAFailedUndoStep");
-    createPartWithDetachedCopy(metadata, {{"a", "ka"}});
-
-    /// Write #1 decrements the count of "part/a", #2 fails the transaction, #3 restores the count in the rollback.
-    disk->arm({.write_file = {3}});
-    {
-        auto tx = metadata->createTransaction();
-        tx->unlinkFile("part/a", /*if_exists=*/false, /*should_remove_objects=*/true);
-        tx->createMetadataFile("non-existing/fail-tx", /*objects=*/{});
-        EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), std::exception);
-    }
-    EXPECT_EQ(disk->firedFaults(), 1);
-    disk->disarm();
-
-    ASSERT_TRUE(metadata->existsFile("part/a"));
-    EXPECT_EQ(metadata->getHardlinkCount("part/a"), 1);
-
-    {
-        auto tx = metadata->createTransaction();
-        tx->removeRecursive("part", /*should_remove_objects=*/nullptr);
-        tx->commit(DB::NoCommitOptions{});
-        verifyBlobsToRemove(metadata, {});
-    }
-}
-
 /// Rolling back a recursive removal restores the count of a file that has two links inside the removed directory.
 TEST_F(MetadataLocalDiskTest, TestRemoveRecursiveRollbackRestoresSharedInodeCount)
 {
@@ -1795,8 +1767,66 @@ TEST_F(MetadataLocalDiskTest, TestRollbackUndoesOnlyWhatAFailedOperationDid)
             .check = [&](const Metadata & metadata) { EXPECT_EQ(metadata->getLastModified("s").epochTime(), old_time.epochTime()); },
         },
         {
+            .name = "write a file onto an existing directory",
+            .setup = [&](const Metadata & metadata)
+            {
+                auto tx = metadata->createTransaction();
+                tx->createDirectory("wd");
+                tx->commit(DB::NoCommitOptions{});
+            },
+            .operation = [](Transaction & tx) { tx.createMetadataFile("wd", {}); },
+            .check = [&](const Metadata & metadata) { EXPECT_TRUE(metadata->existsDirectory("wd")); },
+        },
+        {
             .name = "change the mode of a missing file",
             .operation = [](Transaction & tx) { tx.chmod("missing", 0644); },
+        },
+        {
+            .name = "move a file",
+            .setup = [&](const Metadata & metadata) { create_files(metadata, {"mf"}); },
+            .operation = [](Transaction & tx) { tx.moveFile("mf", "mf2"); },
+            .check = [&](const Metadata & metadata) { expect_blob(metadata, "mf"); EXPECT_FALSE(metadata->existsFile("mf2")); },
+        },
+        {
+            .name = "move a directory",
+            .setup = [&](const Metadata & metadata)
+            {
+                auto tx = metadata->createTransaction();
+                tx->createDirectory("md");
+                tx->commit(DB::NoCommitOptions{});
+                create_files(metadata, {"md/f"});
+            },
+            .operation = [](Transaction & tx) { tx.moveDirectory("md", "md2"); },
+            .check = [&](const Metadata & metadata) { expect_blob(metadata, "md/f"); EXPECT_FALSE(metadata->existsDirectory("md2")); },
+        },
+        {
+            .name = "create a directory",
+            .operation = [](Transaction & tx) { tx.createDirectory("nd"); },
+            .check = [&](const Metadata & metadata) { EXPECT_FALSE(metadata->existsDirectory("nd")); },
+        },
+        {
+            .name = "set the modification time",
+            .setup = [&](const Metadata & metadata)
+            {
+                create_files(metadata, {"t"});
+                auto tx = metadata->createTransaction();
+                tx->setLastModified("t", old_time);
+                tx->commit(DB::NoCommitOptions{});
+            },
+            .operation = [](Transaction & tx) { tx.setLastModified("t", Poco::Timestamp::fromEpochTime(2000000000)); },
+            .check = [&](const Metadata & metadata) { EXPECT_EQ(metadata->getLastModified("t").epochTime(), old_time.epochTime()); },
+        },
+        {
+            .name = "change the mode of a file",
+            .setup = [&](const Metadata & metadata)
+            {
+                create_files(metadata, {"m"});
+                auto tx = metadata->createTransaction();
+                tx->chmod("m", 0640);
+                tx->commit(DB::NoCommitOptions{});
+            },
+            .operation = [](Transaction & tx) { tx.chmod("m", 0600); },
+            .check = [&](const Metadata & metadata) { EXPECT_EQ(metadata->stat("m").st_mode & 0777, 0640u); },
         },
         {
             .name = "create a hard link onto another file",

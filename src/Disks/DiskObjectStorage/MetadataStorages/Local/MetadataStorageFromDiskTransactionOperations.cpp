@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/DiskObjectStorageMetadata.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDiskTransactionOperations.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/UndoWithRetries.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/IDisk.h>
 
@@ -23,11 +22,6 @@
 #include <utility>
 
 namespace fs = std::filesystem;
-
-namespace ProfileEvents
-{
-    extern const Event MetadataFromDiskUndoStageRetries;
-}
 
 namespace DB
 {
@@ -65,11 +59,6 @@ std::optional<DiskObjectStorageMetadata> tryReadMetadataFile(const std::string &
     return object_metadata;
 }
 
-void undoStep(std::string_view description, const std::function<void()> & step)
-{
-    undoWithRetries(getLogger("MetadataStorageFromDisk"), ProfileEvents::MetadataFromDiskUndoStageRetries, description, step);
-}
-
 }
 
 SetLastModifiedOperation::SetLastModifiedOperation(std::string path_, Poco::Timestamp new_timestamp_, IDisk & disk_)
@@ -88,7 +77,7 @@ void SetLastModifiedOperation::execute()
 void SetLastModifiedOperation::undo()
 {
     if (old_timestamp)
-        undoStep(fmt::format("restore the modification time of '{}'", path), [&] { disk.setLastModified(path, *old_timestamp); });
+        disk.setLastModified(path, *old_timestamp);
 }
 
 ChmodOperation::ChmodOperation(std::string path_, mode_t mode_, IDisk & disk_)
@@ -107,7 +96,7 @@ void ChmodOperation::execute()
 void ChmodOperation::undo()
 {
     if (old_mode)
-        undoStep(fmt::format("restore the mode of '{}'", path), [&] { disk.chmod(path, *old_mode); });
+        disk.chmod(path, *old_mode);
 }
 
 WriteFileOperation::WriteFileOperation(std::string path_, std::string data_, IDisk & disk_)
@@ -127,7 +116,7 @@ void WriteFileOperation::execute()
         });
         std::string file_data;
         readStringUntilEOF(file_data, *buf);
-        prev_data = std::move(file_data);
+        prev_data = file_data;
     }
 
     write_attempted = true;
@@ -141,19 +130,16 @@ void WriteFileOperation::undo()
     if (!write_attempted)
         return;
 
-    undoStep(fmt::format("restore '{}'", path), [&]
+    if (prev_data.has_value())
     {
-        if (prev_data)
-        {
-            auto buf = disk.writeFile(path);
-            writeString(*prev_data, *buf);
-            buf->finalize();
-        }
-        else if (disk.existsFile(path))
-        {
-            disk.removeFile(path);
-        }
-    });
+        auto buf = disk.writeFile(path);
+        writeString(prev_data.value(), *buf);
+        buf->finalize();
+    }
+    else if (disk.existsFile(path))
+    {
+        disk.removeFile(path);
+    }
 }
 
 UnlinkFileOperation::UnlinkFileOperation(std::string path_, bool if_exists_, bool should_remove_objects_, const std::string & compatible_key_prefix_, IDisk & disk_, StoredObjects & objects_to_remove_)
@@ -205,12 +191,8 @@ void UnlinkFileOperation::execute()
 
 void UnlinkFileOperation::undo()
 {
-    if (tmp_file_path)
-        undoStep(fmt::format("move '{}' back to '{}'", *tmp_file_path, path), [&]
-        {
-            if (disk.existsFile(*tmp_file_path))
-                disk.moveFile(*tmp_file_path, path);
-        });
+    if (tmp_file_path.has_value())
+        disk.moveFile(tmp_file_path.value(), path);
 
     if (write_operation)
         write_operation->undo();
@@ -242,7 +224,7 @@ void CreateDirectoryOperation::execute()
 void CreateDirectoryOperation::undo()
 {
     if (created)
-        undoStep(fmt::format("remove directory '{}'", path), [&] { disk.removeDirectoryIfExists(path); });
+        disk.removeDirectory(path);
 }
 
 CreateDirectoryRecursiveOperation::CreateDirectoryRecursiveOperation(std::string path_, IDisk & disk_)
@@ -269,11 +251,8 @@ void CreateDirectoryRecursiveOperation::execute()
 
 void CreateDirectoryRecursiveOperation::undo()
 {
-    undoStep(fmt::format("remove the directories created for '{}'", path), [&]
-    {
-        for (const auto & path_created : paths_created)
-            disk.removeDirectoryIfExists(path_created);
-    });
+    for (const auto & path_created : paths_created)
+        disk.removeDirectoryIfExists(path_created);
 }
 
 RemoveDirectoryOperation::RemoveDirectoryOperation(std::string path_, IDisk & disk_)
@@ -291,7 +270,7 @@ void RemoveDirectoryOperation::execute()
 void RemoveDirectoryOperation::undo()
 {
     if (removed)
-        undoStep(fmt::format("create directory '{}'", path), [&] { disk.createDirectory(path); });
+        disk.createDirectory(path);
 }
 
 RemoveRecursiveOperation::RemoveRecursiveOperation(std::string path_, IMetadataTransaction::ShouldRemoveObjectsPredicate should_remove_objects_, const std::string & compatible_key_prefix_, IDisk & disk_, StoredObjects & objects_to_remove_)
@@ -363,18 +342,10 @@ void RemoveRecursiveOperation::execute()
 
 void RemoveRecursiveOperation::undo()
 {
-    if (temp_file_path)
-        undoStep(fmt::format("move '{}' back to '{}'", *temp_file_path, path), [&]
-        {
-            if (disk.existsFile(*temp_file_path))
-                disk.moveFile(*temp_file_path, path);
-        });
-    else if (temp_directory_path)
-        undoStep(fmt::format("move '{}' back to '{}'", *temp_directory_path, path), [&]
-        {
-            if (disk.existsDirectory(*temp_directory_path))
-                disk.moveDirectory(*temp_directory_path, path);
-        });
+    if (temp_file_path.has_value())
+        disk.moveFile(temp_file_path.value(), path);
+    else if (temp_directory_path.has_value())
+        disk.moveDirectory(temp_directory_path.value(), path);
 
     for (auto & write_op : write_operations | std::views::reverse)
         write_op->undo();
@@ -419,7 +390,7 @@ void CreateHardlinkOperation::undo()
         write_operation->undo();
 
     if (link_created)
-        undoStep(fmt::format("remove '{}'", path_to), [&] { disk.removeFileIfExists(path_to); });
+        disk.removeFileIfExists(path_to);
 }
 
 MoveFileOperation::MoveFileOperation(std::string path_from_, std::string path_to_, IDisk & disk_)
@@ -438,11 +409,7 @@ void MoveFileOperation::execute()
 void MoveFileOperation::undo()
 {
     if (moved)
-        undoStep(fmt::format("move '{}' back to '{}'", path_to, path_from), [&]
-        {
-            if (disk.existsFileOrDirectory(path_to))
-                disk.moveFile(path_to, path_from);
-        });
+        disk.moveFile(path_to, path_from);
 }
 
 MoveDirectoryOperation::MoveDirectoryOperation(std::string path_from_, std::string path_to_, IDisk & disk_)
@@ -461,11 +428,7 @@ void MoveDirectoryOperation::execute()
 void MoveDirectoryOperation::undo()
 {
     if (moved)
-        undoStep(fmt::format("move '{}' back to '{}'", path_to, path_from), [&]
-        {
-            if (disk.existsDirectory(path_to))
-                disk.moveDirectory(path_to, path_from);
-        });
+        disk.moveDirectory(path_to, path_from);
 }
 
 ReplaceFileOperation::ReplaceFileOperation(std::string path_from_, std::string path_to_, const std::string & compatible_key_prefix_, IDisk & disk_, StoredObjects & objects_to_remove_)
@@ -492,11 +455,7 @@ void ReplaceFileOperation::execute()
 void ReplaceFileOperation::undo()
 {
     if (moved)
-        undoStep(fmt::format("move '{}' back to '{}'", path_to, path_from), [&]
-        {
-            if (disk.existsFile(path_to))
-                disk.moveFile(path_to, path_from);
-        });
+        disk.moveFile(path_to, path_from);
 
     if (unlink_operation)
         unlink_operation->undo();
