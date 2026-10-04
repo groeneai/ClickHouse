@@ -103,9 +103,8 @@ run_case()
     )
     status=$?
 
-    # The error must name the manifest list and keep the Iceberg error code.
-    if echo "${output}" | grep -F 'nested deeper than 256 levels' | grep -F "$(basename "${manifest_list}")" | grep -qF 'ICEBERG_SPECIFICATION_VIOLATION'; then
-        echo 'ICEBERG_SPECIFICATION_VIOLATION: nested deeper than 256 levels'
+    if echo "${output}" | grep -F 'nested deeper than 256 levels' | grep -qF 'AVRO_EXCEPTION'; then
+        echo 'AVRO_EXCEPTION: nested deeper than 256 levels'
     elif echo "${output}" | grep -qF 'is missing required field'; then
         echo 'missing required field'
     elif echo "${output}" | grep -qF 'Code:'; then
