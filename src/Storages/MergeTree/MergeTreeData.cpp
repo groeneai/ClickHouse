@@ -6736,7 +6736,7 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
     if (!is_secondary_replay)
         checkColumnTTLsForKeyColumns(new_metadata, old_metadata);
 
-    /// An index an older server stored with such an expression is kept while the ALTER leaves it so.
+    /// An index already captured before the ALTER is accepted unless the ALTER redeclares it.
     if (!is_secondary_replay)
     {
         for (const auto & index : new_metadata.secondary_indices)
