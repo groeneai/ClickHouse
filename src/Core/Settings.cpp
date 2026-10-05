@@ -7282,6 +7282,7 @@ Eliminates min/max/any/anyLast aggregators of GROUP BY keys in SELECT section
     DECLARE(Bool, optimize_injective_functions_in_group_by, true, R"(
 Replaces injective functions by it's arguments in GROUP BY section
 )", 0, \
+        {"26.10", true, true, "`compatibility` with a version before 24.1 no longer disables it: the query analysis that was the default before 24.3 removed injective functions from `GROUP BY` regardless of this setting.", CompatibilitySetting::Ignore}, \
         {"24.1", false, true, "Replace injective functions by it's arguments in GROUP BY section in analyzer"}) \
     DECLARE(Bool, optimize_group_by_function_keys, true, R"(
 Eliminates functions of other keys in GROUP BY section
