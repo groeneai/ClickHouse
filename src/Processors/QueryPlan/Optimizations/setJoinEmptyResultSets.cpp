@@ -97,10 +97,14 @@ void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets)
     }
     else if (const auto * source = dynamic_cast<const SourceStepWithFilter *>(step))
     {
-        /// A remote source evaluates its PREWHERE on other servers, each with its own set.
-        const auto prewhere = source->getPrewhereInfo();
+        /// A remote source evaluates its filters on other servers, each with its own set.
         const auto & snapshot = source->getStorageSnapshot();
-        if (prewhere && prewhere->need_filter && snapshot && !snapshot->storage.isRemote())
+        if (!snapshot || snapshot->storage.isRemote())
+            return;
+        if (const auto row_level_filter = source->getRowLevelFilter())
+            append(getSetsRequiredByFilter(row_level_filter->actions, row_level_filter->column_name));
+        const auto prewhere = source->getPrewhereInfo();
+        if (prewhere && prewhere->need_filter)
             append(getSetsRequiredByFilter(prewhere->prewhere_actions, prewhere->prewhere_column_name));
         return;
     }

@@ -1,8 +1,10 @@
 -- Tags: no-parallel-replicas
 -- A join whose result must be empty because an input is filtered by an empty `IN (subquery)` set returns without reading its other input.
 
+DROP ROW POLICY IF EXISTS p_left_policy ON t_left_policy;
 DROP TABLE IF EXISTS t_left;
 DROP TABLE IF EXISTS t_left_memory;
+DROP TABLE IF EXISTS t_left_policy;
 DROP TABLE IF EXISTS t_empty;
 DROP TABLE IF EXISTS t_keys;
 DROP TABLE IF EXISTS t_set_engine;
@@ -12,6 +14,7 @@ DROP TABLE IF EXISTS t_join_semi;
 
 CREATE TABLE t_left (k String, j String, v UInt64) ENGINE = MergeTree ORDER BY v;
 CREATE TABLE t_left_memory (k String, j String, v UInt64) ENGINE = Memory;
+CREATE TABLE t_left_policy (k String, j String, v UInt64) ENGINE = MergeTree ORDER BY v;
 CREATE TABLE t_empty (k String) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE t_keys (k String) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE t_set_engine (k String) ENGINE = Set;
@@ -21,10 +24,12 @@ CREATE TABLE t_join_semi (j String) ENGINE = Join(SEMI, RIGHT, j);
 
 INSERT INTO t_left SELECT toString(number % 10), toString(number % 7), number FROM numbers(100);
 INSERT INTO t_left_memory SELECT k, j, v FROM t_left;
+INSERT INTO t_left_policy SELECT k, j, v FROM t_left;
 INSERT INTO t_keys VALUES ('1'), ('2');
 INSERT INTO t_join SELECT toString(number), number FROM numbers(7);
 INSERT INTO t_join_right SELECT toString(number) FROM numbers(7);
 INSERT INTO t_join_semi SELECT toString(number) FROM numbers(7);
+CREATE ROW POLICY p_left_policy ON t_left_policy USING k IN (SELECT k FROM t_empty) TO ALL;
 
 SET query_plan_join_swap_table = 'false', query_plan_filter_push_down = 1;
 
@@ -132,6 +137,9 @@ WHERE l.k IN (SELECT k FROM t_empty);
 SELECT 'memory prewhere', count() FROM t_left_memory AS l
 LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
 WHERE l.k IN (SELECT k FROM t_empty) SETTINGS optimize_move_to_prewhere = 1;
+
+SELECT 'row policy', count() FROM t_left_policy AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j;
 
 SELECT 'right semi', count() FROM t_left AS l
 RIGHT SEMI JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r
@@ -248,8 +256,10 @@ SELECT 'explain not in', count() > 0 FROM (EXPLAIN PIPELINE SELECT count() FROM 
     WHERE l.k NOT IN (SELECT k FROM t_empty))
 WHERE explain LIKE '%EmptySetShortCircuitTransform%';
 
+DROP ROW POLICY p_left_policy ON t_left_policy;
 DROP TABLE t_left;
 DROP TABLE t_left_memory;
+DROP TABLE t_left_policy;
 DROP TABLE t_empty;
 DROP TABLE t_keys;
 DROP TABLE t_set_engine;
