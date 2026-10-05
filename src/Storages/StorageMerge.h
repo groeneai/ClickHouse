@@ -339,7 +339,8 @@ private:
         const RowPolicyDataOpt & row_policy_data_opt,
         ContextPtr context,
         ChildPlan & child,
-        bool is_smallest_column_requested);
+        bool is_smallest_column_requested,
+        const NameSet & columns_read_for_nested_sizes);
 
     StorageMerge::StorageListWithLocks getSelectedTables(
         ContextPtr query_context) const;
