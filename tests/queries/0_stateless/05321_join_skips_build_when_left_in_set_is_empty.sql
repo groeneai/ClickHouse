@@ -8,6 +8,7 @@ DROP TABLE IF EXISTS t_keys;
 DROP TABLE IF EXISTS t_set_engine;
 DROP TABLE IF EXISTS t_join;
 DROP TABLE IF EXISTS t_join_right;
+DROP TABLE IF EXISTS t_join_semi;
 
 CREATE TABLE t_left (k String, j String, v UInt64) ENGINE = MergeTree ORDER BY v;
 CREATE TABLE t_left_memory (k String, j String, v UInt64) ENGINE = Memory;
@@ -16,12 +17,14 @@ CREATE TABLE t_keys (k String) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE t_set_engine (k String) ENGINE = Set;
 CREATE TABLE t_join (j String, x UInt64) ENGINE = Join(ANY, LEFT, j);
 CREATE TABLE t_join_right (j String) ENGINE = Join(ALL, RIGHT, j);
+CREATE TABLE t_join_semi (j String) ENGINE = Join(SEMI, RIGHT, j);
 
 INSERT INTO t_left SELECT toString(number % 10), toString(number % 7), number FROM numbers(100);
 INSERT INTO t_left_memory SELECT k, j, v FROM t_left;
 INSERT INTO t_keys VALUES ('1'), ('2');
 INSERT INTO t_join SELECT toString(number), number FROM numbers(7);
 INSERT INTO t_join_right SELECT toString(number) FROM numbers(7);
+INSERT INTO t_join_semi SELECT toString(number) FROM numbers(7);
 
 SET query_plan_join_swap_table = 'false', query_plan_filter_push_down = 1;
 
@@ -130,6 +133,27 @@ SELECT 'memory prewhere', count() FROM t_left_memory AS l
 LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
 WHERE l.k IN (SELECT k FROM t_empty) SETTINGS optimize_move_to_prewhere = 1;
 
+SELECT 'right semi', count() FROM t_left AS l
+RIGHT SEMI JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r
+ON l.j = r.j AND l.k IN (SELECT k FROM t_empty);
+
+SELECT 'left semi swapped', count() FROM (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r
+LEFT SEMI JOIN t_left AS l ON r.j = l.j AND l.k IN (SELECT k FROM t_empty) SETTINGS query_plan_join_swap_table = 'true';
+
+SELECT 'left semi ie_join', count() FROM (SELECT if(throwIf(number >= 0, 'right side was read'), 0, number) AS a, number AS b FROM numbers(10)) AS r
+LEFT SEMI JOIN t_left AS l ON r.a > l.v AND r.b < l.v AND l.k IN (SELECT k FROM t_empty) SETTINGS join_algorithm = 'ie_join';
+
+SELECT 'filled semi chain', count() FROM t_left AS l
+RIGHT SEMI JOIN t_join_semi AS tjs ON l.j = tjs.j
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON tjs.j = r.j
+PREWHERE l.k IN (SELECT k FROM t_empty);
+
+SELECT 'runtime filter chain', count() FROM t_left AS l
+INNER JOIN t_left_memory AS m ON l.v = m.v
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE m.k IN (SELECT k FROM t_empty)
+SETTINGS enable_join_runtime_filters = 1, join_runtime_filter_min_probe_rows = 0, query_plan_optimize_join_order_limit = 1;
+
 -- The join still runs in full when its result does not have to be empty.
 
 SELECT 'not in', count() FROM t_left AS l
@@ -167,6 +191,9 @@ SELECT 'or', count() FROM t_left AS l
 LEFT JOIN (SELECT toString(number) AS j FROM numbers(5)) AS r ON l.j = r.j
 WHERE l.k IN (SELECT k FROM t_empty) OR l.v >= 50;
 
+SELECT 'right anti', count() FROM t_left AS l
+RIGHT ANTI JOIN (SELECT toString(number) AS j FROM numbers(10)) AS r ON l.j = r.j AND l.k IN (SELECT k FROM t_empty);
+
 -- The pipeline gets the short-circuit only for an immutable set.
 
 SELECT 'explain subquery set', count() > 0 FROM (EXPLAIN PIPELINE SELECT count() FROM t_left AS l
@@ -191,3 +218,4 @@ DROP TABLE t_keys;
 DROP TABLE t_set_engine;
 DROP TABLE t_join;
 DROP TABLE t_join_right;
+DROP TABLE t_join_semi;

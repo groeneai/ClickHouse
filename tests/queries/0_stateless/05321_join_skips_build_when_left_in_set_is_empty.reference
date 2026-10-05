@@ -22,6 +22,11 @@ inner right filter	0
 left full_sorting_merge onfly	0
 filled chain	0
 memory prewhere	0
+right semi	0
+left semi swapped	0
+left semi ie_join	0
+filled semi chain	0
+runtime filter chain	0
 not in	100
 non-empty set	20	15
 right	5
@@ -33,6 +38,7 @@ right then left	5
 left, empty right	100
 filled right chain	7
 or	50
+right anti	10
 explain subquery set	1
 explain Set table	0
 explain not in	0

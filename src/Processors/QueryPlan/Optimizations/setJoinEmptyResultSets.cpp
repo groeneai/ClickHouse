@@ -1,4 +1,5 @@
 #include <Processors/QueryPlan/Optimizations/Optimizations.h>
+#include <Processors/QueryPlan/BuildRuntimeFilterStep.h>
 #include <Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
@@ -21,9 +22,16 @@ namespace DB::QueryPlanOptimizations
 namespace
 {
 
-/// Whether an empty left / right input makes a join of this kind return no rows.
-bool leftInputEmptiesJoin(JoinKind kind) { return isInnerOrLeft(kind) || isCrossOrComma(kind); }
-bool rightInputEmptiesJoin(JoinKind kind) { return isInnerOrRight(kind) || isCrossOrComma(kind); }
+/// Whether an empty left / right input makes a join of this kind return no rows; a semi join needs a match on both sides.
+bool leftInputEmptiesJoin(JoinKind kind, JoinStrictness strictness)
+{
+    return isInnerOrLeft(kind) || isCrossOrComma(kind) || (isRight(kind) && strictness == JoinStrictness::Semi);
+}
+
+bool rightInputEmptiesJoin(JoinKind kind, JoinStrictness strictness)
+{
+    return isInnerOrRight(kind) || isCrossOrComma(kind) || (isLeft(kind) && strictness == JoinStrictness::Semi);
+}
 
 void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets);
 
@@ -39,15 +47,16 @@ bool collectJoinInputSets(const QueryPlan::Node & node, std::vector<FutureSetPtr
         return false;
 
     const JoinKind kind = join ? join->getJoin()->getTableJoin().kind() : ie_join->getQueryKind();
+    const JoinStrictness strictness = join ? join->getJoin()->getTableJoin().strictness() : ie_join->getQueryStrictness();
     const QueryPlan::Node * left = node.children[0];
     const QueryPlan::Node * right = node.children[1];
     /// With `swap_streams` the pipelines are swapped at execution and the TableJoin is already swapped.
     if (join && join->swap_streams)
         std::swap(left, right);
 
-    if (leftInputEmptiesJoin(kind))
+    if (leftInputEmptiesJoin(kind, strictness))
         collectSets(*left, sets);
-    if (rightInputEmptiesJoin(kind))
+    if (rightInputEmptiesJoin(kind, strictness))
         collectSets(*right, sets);
     return true;
 }
@@ -73,12 +82,13 @@ void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets)
         return;
     else if (const auto * filled_join = typeid_cast<const FilledJoinStep *>(step))
     {
-        /// A RIGHT or FULL filled join also emits the stored rows nobody matched.
-        if (!leftInputEmptiesJoin(filled_join->getJoin()->getTableJoin().kind()))
+        /// A RIGHT or FULL filled join, unless SEMI, also emits the stored rows nobody matched.
+        const auto & table_join = filled_join->getJoin()->getTableJoin();
+        if (!leftInputEmptiesJoin(table_join.kind(), table_join.strictness()))
             return;
     }
     else if (!typeid_cast<const ExpressionStep *>(step) && !typeid_cast<const SortingStep *>(step)
-        && !typeid_cast<const CreateSetAndFilterOnTheFlyStep *>(step))
+        && !typeid_cast<const CreateSetAndFilterOnTheFlyStep *>(step) && !typeid_cast<const BuildRuntimeFilterStep *>(step))
         return;
 
     if (node.children.size() == 1)

@@ -37,6 +37,7 @@ public:
     String getName() const override { return "IEJoin"; }
 
     JoinKind getQueryKind() const { return query_kind; }
+    JoinStrictness getQueryStrictness() const { return query_strictness; }
     void setEmptyResultSets(std::vector<FutureSetPtr> sets) { empty_result_sets = std::move(sets); }
 
     QueryPipelineBuilderPtr updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings &) override;
