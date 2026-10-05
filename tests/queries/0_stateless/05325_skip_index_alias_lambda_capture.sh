@@ -80,16 +80,22 @@ CREATE TABLE t_auto
     f UInt32 ALIAS y + 1,
     d UInt32 ALIAS arrayMax(arrayMap(k -> e, arr)),
     m UInt32 ALIAS arrayMax(arrayMap(x -> e, arr)),
-    g UInt32 ALIAS arrayMax(arrayMap(z -> f, arr))
+    g UInt32 ALIAS arrayMax(arrayMap(z -> f, arr)),
+    s String,
+    es String ALIAS s,
+    n UInt64 ALIAS arrayMax(arrayMap(s -> length(es), arr))
 )
 ENGINE = MergeTree ORDER BY tuple() SETTINGS add_minmax_index_for_numeric_columns = 1;
 ALTER TABLE t_auto ADD COLUMN d2 UInt32 ALIAS arrayMin(arrayMap(k -> e, arr));
 ALTER TABLE t_auto ADD COLUMN m2 UInt32 ALIAS arrayMin(arrayMap(x -> e, arr));
+ALTER TABLE t_auto ADD COLUMN n2 UInt64 ALIAS arrayMin(arrayMap(s -> length(es), arr));
 ALTER TABLE t_auto RENAME COLUMN y TO z;
 SELECT name, expr FROM system.data_skipping_indices
 WHERE database = currentDatabase() AND table = 't_auto'
-    AND name IN ('auto_minmax_index_d', 'auto_minmax_index_d2', 'auto_minmax_index_m', 'auto_minmax_index_m2')
+    AND name IN ('auto_minmax_index_d', 'auto_minmax_index_d2', 'auto_minmax_index_m', 'auto_minmax_index_m2', 'auto_minmax_index_n', 'auto_minmax_index_n2')
 ORDER BY name;
+INSERT INTO t_auto (k, z, arr, s) VALUES (5, 1, [100], 'abc');
+SELECT n, n2 FROM t_auto;
 "
 
 echo '--- stored definition ---'

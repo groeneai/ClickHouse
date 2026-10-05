@@ -24,6 +24,7 @@ n	arrayMax(arrayMap(x -> (k2 + 1), arr))
 --- automatic minmax index ---
 auto_minmax_index_m	arrayMax(arrayMap(x -> (k + 1), arr))
 auto_minmax_index_m2	arrayMin(arrayMap(x -> (k + 1), arr))
+3	3
 --- stored definition ---
 1
 arrayMax(arrayMap(k -> (k + 1), arr))
