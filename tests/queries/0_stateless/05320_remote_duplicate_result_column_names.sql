@@ -3,6 +3,7 @@
 -- A projection alias that reuses the name of a column expanded from `*` gives a result with two
 -- columns of the same name. Each of them must keep its own values when a shard runs the query.
 
+DROP TABLE IF EXISTS t_05320_dist;
 DROP TABLE IF EXISTS t_05320;
 CREATE TABLE t_05320 (d Date, v UInt64) ENGINE = MergeTree ORDER BY d;
 INSERT INTO t_05320 VALUES ('2026-01-01', 1), ('2026-01-02', 2);
@@ -27,4 +28,10 @@ SELECT *, sum(v) AS v FROM remote('127.0.0.2', currentDatabase(), t_05320) GROUP
 SELECT v, v FROM remote('127.0.0.2', currentDatabase(), t_05320) ORDER BY 1;
 SELECT *, d + 365 AS d FROM remote('127.0.0.2', currentDatabase(), t_05320) AS r ORDER BY v;
 
+-- A Distributed table with one shard computes the whole query under merge().
+CREATE TABLE t_05320_dist AS t_05320 ENGINE = Distributed(test_shard_localhost, currentDatabase(), t_05320);
+SELECT *, d + 365 AS d FROM merge(currentDatabase(), '^t_05320_dist$') ORDER BY v SETTINGS prefer_localhost_replica = 1 FORMAT TSVWithNames;
+SELECT *, d + 365 AS d FROM merge(currentDatabase(), '^t_05320_dist$') ORDER BY v SETTINGS prefer_localhost_replica = 0;
+
+DROP TABLE t_05320_dist;
 DROP TABLE t_05320;

@@ -2402,6 +2402,8 @@ void ReadFromMerge::convertAndFilterSourceStream(
     ColumnsWithTypeAndName converted_columns;
     size_t size = current_step_columns.size();
     converted_columns.reserve(current_step_columns.size());
+    /// Same-named columns (SELECT *, x + 1 AS x) cannot be told apart by name; the child produces them in header order.
+    const bool match_by_position = header.getIndexByName().size() < header.columns() && size == header.columns();
     auto materializeIfSourceIsNotConst = [](const ColumnWithTypeAndName & expected, const ColumnWithTypeAndName & source)
     {
         if (expected.column && isColumnConst(*expected.column) && (!source.column || !isColumnConst(*source.column)))
@@ -2417,7 +2419,11 @@ void ReadFromMerge::convertAndFilterSourceStream(
     for (size_t i = 0; i < size; ++i)
     {
         const auto & source_elem = current_step_columns[i];
-        if (header.has(source_elem.name))
+        if (match_by_position)
+        {
+            converted_columns.push_back(materializeIfSourceIsNotConst(header.getByPosition(i), source_elem));
+        }
+        else if (header.has(source_elem.name))
         {
             converted_columns.push_back(materializeIfSourceIsNotConst(header.getByName(source_elem.name), source_elem));
         }
@@ -2444,8 +2450,15 @@ void ReadFromMerge::convertAndFilterSourceStream(
         ActionsDAG::MatchColumnsMode::Position,
         local_context);
 
+    if (match_by_position)
+        convert_actions_dag.addMaterializingOutputActions(/*materialize_sparse=*/ false);
+
     auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(convert_actions_dag));
     child.plan.addStep(std::move(expression_step));
+
+    /// Nothing is missing when matched by position, and filling missing columns below selects them by name.
+    if (match_by_position)
+        return;
 
     /// Add missing columns for the resulting Merge table.
     {
