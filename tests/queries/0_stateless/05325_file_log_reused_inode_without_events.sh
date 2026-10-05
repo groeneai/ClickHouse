@@ -37,6 +37,8 @@ function write_with_inode()
     return 1
 }
 
+# Before the table: the directory is watched only some time after CREATE returns.
+printf '1\n2\n3\n' > "$dir/a.csv"
 $CLICKHOUSE_CLIENT -q "CREATE TABLE file_log (v UInt64) ENGINE = FileLog('$dir/*.csv', 'CSV') SETTINGS max_threads = 1, poll_timeout_ms = 100"
 
 step=0
@@ -57,7 +59,6 @@ function read_rows()
     grep -v -e '^barrier_' -e '^$' <<< "$rows" | LC_ALL=C sort
 }
 
-printf '1\n2\n3\n' > "$dir/a.csv"
 read_rows "initial scan"
 
 $CLICKHOUSE_CLIENT -q "DETACH TABLE file_log"
