@@ -1065,6 +1065,18 @@ static std::pair<size_t, size_t> countAndCapReplicas(
     return {available_replicas, max_replicas_to_use};
 }
 
+String getParallelReplicasCoordinatorClusterScope(const ContextPtr & context, const Cluster & cluster)
+{
+    /// The shard-scope identity is the same for every alias of the same ordered shards, and it survives
+    /// narrowing the cluster to a single shard (`getClusterWithSingleShard`), so the dispatch, which holds the
+    /// narrowed cluster, and the read, which holds the full one, derive the same scope. A cluster without an
+    /// identity is scoped by the `cluster_for_parallel_replicas` it was resolved from. The prefixes keep the
+    /// two kinds of scope from ever comparing equal.
+    if (const auto & identity = cluster.getShardScopeIdentity(); !identity.empty())
+        return "identity:" + identity;
+    return "name:" + context->getSettingsRef()[Setting::cluster_for_parallel_replicas].value;
+}
+
 size_t getActiveReplicasCountForParallelReplicas(const ContextPtr & context, const ClusterPtr & cluster)
 {
     /// A coordinator sized on this server is authoritative. Every dispatch that builds a coordinator
@@ -1072,11 +1084,11 @@ size_t getActiveReplicasCountForParallelReplicas(const ContextPtr & context, con
     /// writes the count it was sized with into this server-owned context carrier before any reading step of
     /// the query is built, so a coordinated read on this server can never observe a different count than its
     /// coordinator. No client can write this carrier: it is not part of `ClientInfo` and is never deserialized.
-    /// The carrier is copied into every derived context, so it is scoped to the `cluster_for_parallel_replicas`
-    /// the coordinator was sized for: a nested view or subquery that re-points the setting at another cluster
-    /// does not inherit the outer read's count.
+    /// The carrier is copied into every derived context, so it is scoped to the cluster the coordinator was
+    /// sized for: a nested view or subquery that re-points `cluster_for_parallel_replicas` at another cluster
+    /// does not inherit the outer read's count, while re-pointing it at an alias of the same shards keeps it.
     if (const auto coordinator_replicas_count
-        = context->getParallelReplicasCoordinatorCount(context->getSettingsRef()[Setting::cluster_for_parallel_replicas]))
+        = context->getParallelReplicasCoordinatorCount(cluster ? getParallelReplicasCoordinatorClusterScope(context, *cluster) : String{}))
         return *coordinator_replicas_count;
 
     /// Without a coordinator on this server the read is a follower read: the coordinator lives on the
@@ -1276,7 +1288,7 @@ void executeQueryWithParallelReplicas(
     /// client-writable, so it is consulted only by follower reads (see `getActiveReplicasCountForParallelReplicas`).
     new_context->getClientInfo().obsolete_count_participating_replicas = max_replicas_to_use;
     new_context->setParallelReplicasCoordinatorCount(
-        max_replicas_to_use, new_context->getSettingsRef()[Setting::cluster_for_parallel_replicas]);
+        max_replicas_to_use, getParallelReplicasCoordinatorClusterScope(new_context, *cluster));
 
     auto external_tables = new_context->getExternalTables();
     auto coordinator = std::make_shared<ParallelReplicasReadingCoordinator>(max_replicas_to_use);
@@ -1405,7 +1417,7 @@ QueryPlanPtr createParallelReplicasPlan(QueryPlanPtr plan_fragment, ContextPtr c
     auto [connection_pools, max_replicas_to_use] = prepareConnectionPoolsForParallelReplicas(logger, new_context, cluster);
     new_context->getClientInfo().obsolete_count_participating_replicas = max_replicas_to_use;
     new_context->setParallelReplicasCoordinatorCount(
-        max_replicas_to_use, new_context->getSettingsRef()[Setting::cluster_for_parallel_replicas]);
+        max_replicas_to_use, getParallelReplicasCoordinatorClusterScope(new_context, *cluster));
     if (connection_pools.size() == 1)
         return nullptr;
 
@@ -1826,7 +1838,7 @@ std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
 
     new_context->getClientInfo().obsolete_count_participating_replicas = max_replicas_to_use;
     new_context->setParallelReplicasCoordinatorCount(
-        max_replicas_to_use, new_context->getSettingsRef()[Setting::cluster_for_parallel_replicas]);
+        max_replicas_to_use, getParallelReplicasCoordinatorClusterScope(new_context, *cluster));
 
     String formatted_query;
     {

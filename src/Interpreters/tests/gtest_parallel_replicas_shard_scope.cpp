@@ -700,3 +700,46 @@ TEST(ParallelReplicasShardScope, ShardSubsetKeepsIdentity)
     EXPECT_EQ(getShardScopeCompat(context, *subset).kind, SCOPE_SCOPED);
     EXPECT_EQ(getShardScopeIdentityCompat(*subset), getShardScopeIdentityCompat(*original));
 }
+
+/// The coordinator replica count a dispatch records is scoped like `_shard_num`: a nested view or subquery
+/// that re-points `cluster_for_parallel_replicas` at an alias of the same ordered shards keeps the count the
+/// coordinator was sized with instead of recomputing it from liveness, which may have changed in between,
+/// while re-pointing it at another cluster drops it.
+TEST(ParallelReplicasShardScope, CoordinatorReplicasCountFollowsAliasesOfTheSameShards)
+{
+    const auto & settings = getContext().context->getSettingsRef();
+    const HostsByShard shards = {{"127.0.0.1", "127.0.0.2"}, {"127.0.0.3", "127.0.0.4"}};
+
+    auto alias_a = makeConfigCluster(settings, "alias_a", shards);
+    auto alias_b = makeConfigCluster(settings, "alias_b", shards);
+    auto other = makeConfigCluster(settings, "other", {{"127.0.0.5", "127.0.0.6"}});
+
+    auto context = Context::createCopy(getContext().context);
+    context->makeQueryContext();
+
+    /// The dispatch records the count for the cluster narrowed to the shard it reads.
+    const auto scope = getParallelReplicasCoordinatorClusterScope(context, *alias_a->getClusterWithSingleShard(1));
+    EXPECT_EQ(getParallelReplicasCoordinatorClusterScope(context, *alias_a), scope);
+    EXPECT_EQ(getParallelReplicasCoordinatorClusterScope(context, *alias_b), scope);
+    EXPECT_NE(getParallelReplicasCoordinatorClusterScope(context, *other), scope);
+
+    context->setParallelReplicasCoordinatorCount(5, scope);
+    EXPECT_EQ(getActiveReplicasCountForParallelReplicas(context, alias_b), 5u);
+    EXPECT_EQ(getActiveReplicasCountForParallelReplicas(context, other), 2u);
+}
+
+/// A cluster without a shard-scope identity is scoped by the `cluster_for_parallel_replicas` it was resolved from.
+TEST(ParallelReplicasShardScope, CoordinatorReplicasCountOfClusterWithoutIdentityIsScopedBySetting)
+{
+    auto cluster = makeCluster(getContext().context->getSettingsRef(), "some_cluster", 1, 2);
+    ASSERT_TRUE(getShardScopeIdentityCompat(*cluster).empty());
+
+    auto context = Context::createCopy(getContext().context);
+    context->makeQueryContext();
+    context->setSetting("cluster_for_parallel_replicas", Field{"some_cluster"});
+    const auto scope = getParallelReplicasCoordinatorClusterScope(context, *cluster);
+
+    auto nested_context = Context::createCopy(context);
+    nested_context->setSetting("cluster_for_parallel_replicas", Field{"another_cluster"});
+    EXPECT_NE(getParallelReplicasCoordinatorClusterScope(nested_context, *cluster), scope);
+}
