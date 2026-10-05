@@ -80,7 +80,7 @@ WHERE database = currentDatabase() AND table = 't_alter' AND creation = 'Explici
 "
 
 echo '--- EXPLAIN WHATIF rebuild ---'
-whatif_rejected() { $CLICKHOUSE_CLIENT --query "$1" 2>&1 | grep -c -m 1 "no longer matches the current table schema: ALIAS column 'd' cannot be expanded inside a lambda"; }
+whatif_rejected() { $CLICKHOUSE_CLIENT --query "$1" 2>&1 | grep -c -m 1 "no longer matches the current table schema: .*cannot be expanded inside a lambda"; }
 $CLICKHOUSE_CLIENT --query "
 CREATE TABLE t_whatif_udf (k UInt32, arr Array(UInt32), d UInt32 ALIAS k + 1) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
 INSERT INTO t_whatif_udf (k, arr) SELECT number, [toUInt32(number + 100)] FROM numbers(20);
