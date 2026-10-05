@@ -1,12 +1,17 @@
 #include <Processors/QueryPlan/Optimizations/Optimizations.h>
+#include <Processors/QueryPlan/AggregatingStep.h>
+#include <Processors/QueryPlan/ArrayJoinStep.h>
 #include <Processors/QueryPlan/BuildRuntimeFilterStep.h>
 #include <Processors/QueryPlan/CreateSetAndFilterOnTheFlyStep.h>
+#include <Processors/QueryPlan/DistinctStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/IEJoinStep.h>
 #include <Processors/QueryPlan/JoinStep.h>
+#include <Processors/QueryPlan/LimitByStep.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
+#include <Processors/QueryPlan/WindowStep.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Interpreters/IJoin.h>
 #include <Interpreters/PreparedSets.h>
@@ -31,6 +36,17 @@ bool leftInputEmptiesJoin(JoinKind kind, JoinStrictness strictness)
 bool rightInputEmptiesJoin(JoinKind kind, JoinStrictness strictness)
 {
     return isInnerOrRight(kind) || isCrossOrComma(kind) || (isLeft(kind) && strictness == JoinStrictness::Semi);
+}
+
+bool emptyInputEmptiesOutput(const IQueryPlanStep * step)
+{
+    /// Aggregation without keys or by grouping sets, e.g. `GROUPING SETS ((k), ())`, outputs a row for an empty input.
+    if (const auto * aggregating = typeid_cast<const AggregatingStep *>(step))
+        return !aggregating->getParams().keys.empty() && !aggregating->isGroupingSets();
+
+    return typeid_cast<const ExpressionStep *>(step) || typeid_cast<const SortingStep *>(step) || typeid_cast<const DistinctStep *>(step)
+        || typeid_cast<const WindowStep *>(step) || typeid_cast<const LimitByStep *>(step)
+        || typeid_cast<const CreateSetAndFilterOnTheFlyStep *>(step) || typeid_cast<const BuildRuntimeFilterStep *>(step);
 }
 
 void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets);
@@ -65,10 +81,15 @@ bool collectJoinInputSets(const QueryPlan::Node & node, std::vector<FutureSetPtr
 void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets)
 {
     auto append = [&sets](std::vector<FutureSetPtr> more) { std::ranges::move(more, std::back_inserter(sets)); };
-    /// Each step walked emits only rows derived from its input rows, so an empty input empties its output.
     const auto * step = node.step.get();
     if (const auto * filter = typeid_cast<const FilterStep *>(step))
         append(getSetsRequiredByFilter(filter->getExpression(), filter->getFilterColumnName()));
+    else if (const auto * array_join = typeid_cast<const ArrayJoinStep *>(step))
+    {
+        /// Unlike LEFT ARRAY JOIN, ARRAY JOIN outputs nothing for a row whose elements are all filtered out.
+        if (array_join->hasElementFilter() && !array_join->isLeft())
+            append(getSetsRequiredByFilter(*array_join->getElementFilter(), array_join->getElementFilterColumnName()));
+    }
     else if (const auto * source = dynamic_cast<const SourceStepWithFilter *>(step))
     {
         /// A remote source evaluates its PREWHERE on other servers, each with its own set.
@@ -87,8 +108,7 @@ void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets)
         if (!leftInputEmptiesJoin(table_join.kind(), table_join.strictness()))
             return;
     }
-    else if (!typeid_cast<const ExpressionStep *>(step) && !typeid_cast<const SortingStep *>(step)
-        && !typeid_cast<const CreateSetAndFilterOnTheFlyStep *>(step) && !typeid_cast<const BuildRuntimeFilterStep *>(step))
+    else if (!emptyInputEmptiesOutput(step))
         return;
 
     if (node.children.size() == 1)

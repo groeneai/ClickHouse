@@ -27,6 +27,12 @@ left semi swapped	0
 left semi ie_join	0
 filled semi chain	0
 runtime filter chain	0
+distinct	0
+array join	0
+array join element	0
+window subquery	0	0
+limit by	0
+group by	0
 not in	100
 non-empty set	20	15
 right	5

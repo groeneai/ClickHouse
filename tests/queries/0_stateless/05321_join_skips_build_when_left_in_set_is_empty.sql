@@ -154,6 +154,30 @@ LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(n
 WHERE m.k IN (SELECT k FROM t_empty)
 SETTINGS enable_join_runtime_filters = 1, join_runtime_filter_min_probe_rows = 0, query_plan_optimize_join_order_limit = 1;
 
+SELECT 'distinct', count() FROM (SELECT DISTINCT k, j FROM t_left) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
+SELECT 'array join', count() FROM (SELECT k, j, a FROM t_left ARRAY JOIN [1, 2] AS a) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
+SELECT 'array join element', count() FROM (SELECT k, j, a FROM t_left ARRAY JOIN [1, 2] AS a) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE toString(l.a) IN (SELECT k FROM t_empty) SETTINGS query_plan_fuse_filter_into_array_join = 1;
+
+SELECT 'window subquery', count(), sum(l.rn) FROM (SELECT k, j, row_number() OVER (PARTITION BY k ORDER BY v) AS rn FROM t_left) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
+SELECT 'limit by', count() FROM (SELECT k, j FROM t_left ORDER BY v LIMIT 2 BY k) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty) SETTINGS query_plan_filter_push_down_below_limit_by = 1;
+
+SELECT 'group by', count() FROM (SELECT k, any(j) AS j FROM t_left GROUP BY k) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
 -- The join still runs in full when its result does not have to be empty.
 
 SELECT 'not in', count() FROM t_left AS l
