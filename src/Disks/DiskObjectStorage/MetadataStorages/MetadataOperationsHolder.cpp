@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <Common/LockMemoryExceptionInThread.h>
 #include <Common/ProfileEvents.h>
+#include <Common/noexcept_scope.h>
 
 #include <exception>
 
@@ -26,6 +27,12 @@ void MetadataOperationsHolder::rollback(size_t until_pos, Exception & rollback_r
 
     for (int64_t i = until_pos; i >= 0; --i)
     {
+        if (noexcept_rollback)
+        {
+            NOEXCEPT_SCOPE(operations[i]->undo());
+            continue;
+        }
+
         try
         {
             operations[i]->undo();

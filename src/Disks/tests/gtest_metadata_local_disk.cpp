@@ -1612,6 +1612,34 @@ TEST_F(MetadataLocalDiskTest, TestRollbackIsNotStoppedByMemoryLimit)
     }
 }
 
+using MetadataLocalDiskDeathTest = MetadataLocalDiskTest;
+
+/// The disk of the child process, which dies before `TearDown` could remove it.
+static std::string terminated_disk_path;
+
+/// An `undo` that throws terminates the server, so a partially rolled back transaction is never left behind.
+TEST_F(MetadataLocalDiskDeathTest, TestFailedUndoTerminates)
+{
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+    auto [metadata, disk] = getFaultInjectingMetadataStorage("/TestFailedUndoTerminates");
+    createPartWithDetachedCopy(metadata, {{"f", "kf"}});
+    terminated_disk_path = disk->getPath();
+
+    /// Write #1 decrements the count of "detached/f", #2 fails the transaction, #3 restores the count in the rollback.
+    disk->arm({.write_file = {3}});
+    EXPECT_EXIT(
+        {
+            std::set_terminate([] { fs::remove_all(terminated_disk_path); std::_Exit(42); });
+            auto tx = metadata->createTransaction();
+            tx->removeRecursive("detached", /*should_remove_objects=*/nullptr);
+            tx->createMetadataFile("non-existing/fail-tx", /*objects=*/{});
+            tx->commit(DB::NoCommitOptions{});
+        },
+        ::testing::ExitedWithCode(42), "");
+    disk->disarm();
+}
+
 /// Rolling back a recursive removal restores the count of a file that has two links inside the removed directory.
 TEST_F(MetadataLocalDiskTest, TestRemoveRecursiveRollbackRestoresSharedInodeCount)
 {
