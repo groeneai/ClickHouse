@@ -1778,8 +1778,7 @@ public:
         return result;
     }
 
-    /// The identifier resolve cache can hand one node to several clauses. A node is rewritten once, after its
-    /// arguments, so its result does not depend on the path it is reached by; other references get that result.
+    /// Shared nodes (identifier resolve cache) are rewritten once, after their arguments, and every reference reuses the result.
     std::unordered_map<QueryTreeNodePtr, QueryTreeNodePtr> visited_nodes;
 
     bool needChildVisit(QueryTreeNodePtr &, QueryTreeNodePtr & child)
