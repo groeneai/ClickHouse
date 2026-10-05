@@ -1,4 +1,5 @@
 -- Tags: no-parallel-replicas
+-- Random settings limits: optimize_move_to_prewhere=(1, 1)
 -- A capture-free lambda used by both the SELECT list and WHERE of a bounded streaming read with GROUP BY ALL.
 
 SET enable_streaming_queries = 1;
