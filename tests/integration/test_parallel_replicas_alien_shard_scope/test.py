@@ -90,15 +90,17 @@ def test_shard_scope_of_another_cluster_is_ignored(start_cluster, pr_cluster):
     )
 
     # The result alone would also match a plain `Distributed` read, so check that parallel replicas actually
-    # engaged: shard 1 must have been read by all three of its replicas, each of which logs the sub-query
-    # it received (the coordinator logs the shard query, the other two the parallel-replicas query).
+    # engaged: a plain read sends shard 1's query to a single replica, while parallel replicas send it to
+    # several of them (the coordinator receives the shard query, the others the parallel-replicas query).
+    # Not all three are required: a replica that is slow to connect may be skipped or cancelled once the
+    # others have read everything, which happens with only a thousand rows under sanitizers.
     participating_replicas = 0
     for node in SHARD1_NODES:
         node.query("SYSTEM FLUSH LOGS query_log")
         participating_replicas += int(
             node.query(
                 f"SELECT count() > 0 FROM system.query_log "
-                f"WHERE type = 'QueryFinish' AND initial_query_id = '{query_id}' AND NOT is_initial_query"
+                f"WHERE initial_query_id = '{query_id}' AND NOT is_initial_query"
             )
         )
-    assert participating_replicas == len(SHARD1_NODES)
+    assert participating_replicas >= 2
