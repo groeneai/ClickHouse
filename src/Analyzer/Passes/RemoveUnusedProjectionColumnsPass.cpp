@@ -15,7 +15,7 @@
 
 #include <Analyzer/traverseQueryTree.h>
 
-#include <Storages/IStorage.h>
+#include <Storages/StorageProxy.h>
 
 namespace DB
 {
@@ -97,7 +97,8 @@ void updateUsedProjectionIndexes(const QueryTreeNodePtr & query_or_union_node, s
 
 bool isLocalPhysicalTable(const StoragePtr & storage)
 {
-    return storage->isMergeTree() || storage->getName() == "Memory";
+    auto nested_storage = unwrapStorageProxy(storage);
+    return nested_storage && (nested_storage->isMergeTree() || nested_storage->getName() == "Memory");
 }
 
 /// EXCEPT and INTERSECT compare the kept column, the next step of a recursive CTE reads it, INTERPOLATE refers to it
