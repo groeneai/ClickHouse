@@ -20,7 +20,7 @@ tn NOT, direct read off	[3,4]
 tp IS NULL, direct read off	[1]
 tn IS NULL, direct read off	[1]
 tp merge()	[3,4]
-tn merge()	[3,4]
+tn merge()	[2,3,4]
 2. Nullable(String) with a preprocessor, applied to the haystack of an analyzed index.
 tp_lower	[3,4]
 tn_lower	[3,4]
@@ -61,3 +61,4 @@ tp_map NOT	[]
 tn_map NOT	[2]
 7. Direct read with a part where the index is not materialized.
 tp_partial	[2,12]
+tp_partial direct read	1

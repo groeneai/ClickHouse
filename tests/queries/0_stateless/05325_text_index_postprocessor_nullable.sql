@@ -44,8 +44,9 @@ SELECT 'tp NOT, direct read off', arraySort(groupArray(id)) FROM tp WHERE NOT ha
 SELECT 'tn NOT, direct read off', arraySort(groupArray(id)) FROM tn WHERE NOT hasAnyTokens(s, 'hello') SETTINGS query_plan_direct_read_from_text_index = 0;
 SELECT 'tp IS NULL, direct read off', arraySort(groupArray(id)) FROM tp WHERE hasAnyTokens(s, 'hello') IS NULL SETTINGS query_plan_direct_read_from_text_index = 0;
 SELECT 'tn IS NULL, direct read off', arraySort(groupArray(id)) FROM tn WHERE hasAnyTokens(s, 'hello') IS NULL SETTINGS query_plan_direct_read_from_text_index = 0;
-SELECT 'tp merge()', arraySort(groupArray(id)) FROM merge(currentDatabase(), '^tp$') WHERE NOT hasAnyTokens(s, 'hello') SETTINGS query_plan_direct_read_from_text_index = 0;
-SELECT 'tn merge()', arraySort(groupArray(id)) FROM merge(currentDatabase(), '^tn$') WHERE NOT hasAnyTokens(s, 'hello') SETTINGS query_plan_direct_read_from_text_index = 0;
+-- The uppercase needle matches row 2 only through the postprocessor, so `tp merge()` also shows the rewrite ran.
+SELECT 'tp merge()', arraySort(groupArray(id)) FROM merge(currentDatabase(), '^tp$') WHERE NOT hasAnyTokens(s, 'HELLO') SETTINGS query_plan_direct_read_from_text_index = 0;
+SELECT 'tn merge()', arraySort(groupArray(id)) FROM merge(currentDatabase(), '^tn$') WHERE NOT hasAnyTokens(s, 'HELLO') SETTINGS query_plan_direct_read_from_text_index = 0;
 
 SELECT '2. Nullable(String) with a preprocessor, applied to the haystack of an analyzed index.';
 
@@ -131,6 +132,8 @@ INSERT INTO tp_partial VALUES (1, NULL), (2, 'Hello world'), (3, 'foo');
 ALTER TABLE tp_partial ADD INDEX tix s TYPE text(tokenizer = splitByNonAlpha, postprocessor = lower(s));
 INSERT INTO tp_partial SETTINGS materialize_skip_indexes_on_insert = 1 VALUES (11, NULL), (12, 'Hello'), (13, 'bar');
 SELECT 'tp_partial', arraySort(groupArray(id)) FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1;
+SELECT 'tp_partial direct read', countIf(position(explain, '__text_index_') > 0) > 0
+FROM (EXPLAIN actions = 1 SELECT id FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1);
 
 DROP TABLE tp;
 DROP TABLE tn;
