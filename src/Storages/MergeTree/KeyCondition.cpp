@@ -5036,8 +5036,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
                 (isNativeInteger(key_expr_type_not_null) || isDateTimeOrDateTime64(key_expr_type_not_null))
                 && (isNativeInteger(const_type) || isDateTimeOrDateTime64(const_type));
 
-            /// An integer constant counts whole seconds. Against a sub-second `DateTime64` key it must not stay an
-            /// integer `Field`: `Range` would close an open bound by stepping it a whole second. Same comparison result.
+            /// `Range` closes an open integer bound by stepping it by 1, a whole second here; a scale-0 decimal compares the same.
             if (cast_not_needed && isDateTime64(key_expr_type_not_null)
                 && assert_cast<const DataTypeDateTime64 &>(*key_expr_type_not_null).getScale() > 0)
             {
