@@ -8,6 +8,7 @@
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ITokenizer.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
@@ -242,7 +243,8 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     /// tokens always yields String tokens (normalizing FixedString elements to String to match the build
     /// path and the postprocessor validation) and drops empty tokens, so an empty element never reaches the
     /// postprocessor and cannot fabricate a token the index never stored.
-    ASTPtr tokens_ast = source_ast ? source_ast->clone() : ASTPtr(make_intrusive<ASTIdentifier>(col_name));
+    ASTPtr tokenized_value_ast = source_ast ? source_ast->clone() : ASTPtr(make_intrusive<ASTIdentifier>(col_name));
+    ASTPtr tokens_ast = tokenized_value_ast->clone();
     if (isArray(col_type))
     {
         tokens_ast = makeASTFunction("arrayFlatten",
@@ -263,7 +265,11 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
         makeASTLambda({postprocessor_lambda_arg}, std::move(expr)),
         std::move(tokens_ast));
 
+    auto outputs_ast = make_intrusive<ASTExpressionList>();
+    outputs_ast->children.push_back(std::move(expr));
+    outputs_ast->children.push_back(std::move(tokenized_value_ast));
+
     NamesAndTypesList source_columns{{col_name, col_type}};
-    return buildActionsDAGFromAST(std::move(expr), source_columns);
+    return buildActionsDAGFromASTList(std::move(outputs_ast), source_columns);
 }
 }

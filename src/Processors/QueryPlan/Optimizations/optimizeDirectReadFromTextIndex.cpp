@@ -4,6 +4,7 @@
 #include <Common/FieldVisitorToString.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/assert_cast.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Common/logger_useful.h>
@@ -562,6 +563,7 @@ private:
     {
         const ActionsDAG::Node * node = nullptr;
         std::unordered_map<String, VirtualColumnDescription> added_virtual_columns;
+        bool restores_haystack_null = false;
     };
 
     ActionsDAG & actions_dag;
@@ -834,6 +836,7 @@ private:
         /// Rewrite the haystack into the postprocessed tokens the index stores, so the row-level
         /// function still matches when the index isn't read directly (direct read off, or unmaterialized
         /// parts). getOriginalActionsDAG yields an Array(String) of postprocessed tokens.
+        const ActionsDAG::Node * tokenized_value = nullptr;
         if (apply_postprocessor)
         {
             /// Name the postprocessor's haystack input after the haystack node's actual result_name so
@@ -844,8 +847,9 @@ private:
             actions_dag.mergeNodes(
                 postprocessor->getOriginalActionsDAG(haystack_name, new_children[0]->result_type, tokenizer->getDescription(), preprocessor_source_ast),
                 &merged_outputs);
-            chassert(merged_outputs.size() == 1);
-            new_children[0] = merged_outputs.front();
+            chassert(merged_outputs.size() == 2);
+            new_children[0] = merged_outputs[0];
+            tokenized_value = merged_outputs[1];
 
             /// new_children[0] is now an Array(String) of postprocessed tokens. Switch the tokenizer argument
             /// to 'array' to match them verbatim, instead of re-splitting tokens the index stores whole.
@@ -928,6 +932,18 @@ private:
         FunctionOverloadResolverPtr new_function_base = FunctionFactory::instance().get(function_name, context);
         const ActionsDAG::Node * new_function_node = &actions_dag.addFunction(new_function_base, new_children, "");
 
+        if (tokenized_value
+            && isNullableOrLowCardinalityNullable(function_node.result_type)
+            && isNullableOrLowCardinalityNullable(tokenized_value->result_type))
+        {
+            /// The token array cannot be NULL: keep the NULL of the value it was built from.
+            const auto & is_null = actions_dag.addFunction(FunctionFactory::instance().get("isNull", context), {tokenized_value}, "");
+            auto null_type = makeNullable(std::make_shared<DataTypeUInt8>());
+            const auto & null_node = actions_dag.addColumn(null_type->createColumnConst(0, Field{}), null_type, "NULL");
+            new_function_node = &actions_dag.addFunction(FunctionFactory::instance().get("if", context), {&is_null, &null_node, new_function_node}, "");
+            replacement.restores_haystack_null = true;
+        }
+
         if (!new_function_node->result_type->equals(*function_node.result_type))
             new_function_node = &actions_dag.addCast(*new_function_node, function_node.result_type, "", context);
 
@@ -979,6 +995,10 @@ private:
                     function_node.result_name);
                 return;
             }
+
+            /// The virtual column is UInt8: an unindexed NULL row reads 0, like an indexed one.
+            if (replacement.restores_haystack_null)
+                exact_default_expression = makeASTFunction("ifNull", exact_default_expression, make_intrusive<ASTLiteral>(Field(0)));
         }
 
         auto add_condition_to_input = [&](const SelectedCondition & condition)
