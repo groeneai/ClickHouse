@@ -6,6 +6,7 @@
 1
 1
 1
+1
 --- not captured ---
 i1	arrayMax(arrayMap(x -> (k + 1), arr))
 i2	arrayMax(arrayMap(d -> d, arr))
@@ -13,6 +14,7 @@ i3	k + 1
 i4	arrayMax(arrayMap(k -> arrayMax(arrayMap(k -> (k + 1), arr)), arr))
 6
 i	arrayMax(arrayMap(x -> (k + 1), arr))
+i	text
 --- ALTER ---
 1
 1

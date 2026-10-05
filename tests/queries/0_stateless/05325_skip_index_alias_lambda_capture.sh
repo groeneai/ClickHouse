@@ -23,6 +23,8 @@ rejected "CREATE TABLE t_c6 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt3
     INDEX i arrayMax(arrayMap(t -> t.v, arr)) TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
 rejected "CREATE TABLE t_c7 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt32 ALIAS k + 1,
     w UInt32 ALIAS arrayMax(arrayMap(t -> t.v, arr)), INDEX i w TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
+rejected "CREATE TABLE t_c8 (s String, \`t.v\` String ALIAS upper(s),
+    INDEX i(s) TYPE text(tokenizer = 'splitByNonAlpha', preprocessor = concat(s, arrayStringConcat(arrayMap(t -> lower(t.v), [CAST(tuple('shadow'), 'Tuple(v String)')]), '')))) ENGINE = MergeTree ORDER BY tuple()"
 
 echo '--- not captured ---'
 $CLICKHOUSE_CLIENT --query "
@@ -48,6 +50,12 @@ CREATE TABLE t_ok2 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt32 ALIAS k
     INDEX i arrayMax(arrayMap(x -> t.v, arr)) TYPE minmax) ENGINE = MergeTree ORDER BY tuple();
 SELECT name, expr FROM system.data_skipping_indices
 WHERE database = currentDatabase() AND table = 't_ok2' AND creation = 'Explicit' ORDER BY name;
+"
+$CLICKHOUSE_CLIENT --query "
+CREATE TABLE t_ok3 (s String, \`t.v\` String ALIAS upper(s),
+    INDEX i(s) TYPE text(tokenizer = 'splitByNonAlpha', preprocessor = concat(s, arrayStringConcat(arrayMap(x -> lower(t.v), [CAST(tuple('shadow'), 'Tuple(v String)')]), '')))) ENGINE = MergeTree ORDER BY tuple();
+SELECT name, type FROM system.data_skipping_indices
+WHERE database = currentDatabase() AND table = 't_ok3' AND creation = 'Explicit' ORDER BY name;
 "
 
 echo '--- ALTER ---'
