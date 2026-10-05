@@ -1012,6 +1012,7 @@ void StorageInMemoryMetadata::addImplicitIndicesForColumn(const ColumnDescriptio
             bool valid_index = true;
             try
             {
+                IndexDescription::checkAliasesNotCapturedByLambda(index.definition_ast, columns);
                 static const MergeTreeSettings default_settings;
                 MergeTreeIndexFactory::instance().validate(index, false, default_settings);
             }

@@ -6741,6 +6741,9 @@ void MergeTreeData::checkAlterEligibility(const AlterCommands & commands, Contex
     {
         for (const auto & index : new_metadata.secondary_indices)
         {
+            /// A generated index never refuses the statement, see checkProperties.
+            if (index.isImplicitlyCreated())
+                continue;
             auto failure = tryCheckAliasesNotCapturedByLambda(index, new_metadata.columns);
             if (!failure)
                 continue;

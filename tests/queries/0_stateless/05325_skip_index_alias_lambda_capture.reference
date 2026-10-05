@@ -21,6 +21,9 @@ i4	arrayMax(arrayMap(k -> arrayMax(arrayMap(k -> (k + 1), arr)), arr))
 i	arrayMax(arrayMap(k2 -> 1, arr))
 j	arrayMax(arrayMap(x -> (k2 + 1), arr))
 n	arrayMax(arrayMap(x -> (k2 + 1), arr))
+--- automatic minmax index ---
+auto_minmax_index_m	arrayMax(arrayMap(x -> (k + 1), arr))
+auto_minmax_index_m2	arrayMin(arrayMap(x -> (k + 1), arr))
 --- stored definition ---
 1
 arrayMax(arrayMap(k -> (k + 1), arr))

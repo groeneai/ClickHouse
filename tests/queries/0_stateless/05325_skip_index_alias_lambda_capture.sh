@@ -69,6 +69,29 @@ SELECT name, expr FROM system.data_skipping_indices
 WHERE database = currentDatabase() AND table = 't_alter' AND creation = 'Explicit' ORDER BY name;
 "
 
+echo '--- automatic minmax index ---'
+$CLICKHOUSE_CLIENT --query "
+CREATE TABLE t_auto
+(
+    k UInt32,
+    y UInt32,
+    arr Array(UInt32),
+    e UInt32 ALIAS k + 1,
+    f UInt32 ALIAS y + 1,
+    d UInt32 ALIAS arrayMax(arrayMap(k -> e, arr)),
+    m UInt32 ALIAS arrayMax(arrayMap(x -> e, arr)),
+    g UInt32 ALIAS arrayMax(arrayMap(z -> f, arr))
+)
+ENGINE = MergeTree ORDER BY tuple() SETTINGS add_minmax_index_for_numeric_columns = 1;
+ALTER TABLE t_auto ADD COLUMN d2 UInt32 ALIAS arrayMin(arrayMap(k -> e, arr));
+ALTER TABLE t_auto ADD COLUMN m2 UInt32 ALIAS arrayMin(arrayMap(x -> e, arr));
+ALTER TABLE t_auto RENAME COLUMN y TO z;
+SELECT name, expr FROM system.data_skipping_indices
+WHERE database = currentDatabase() AND table = 't_auto'
+    AND name IN ('auto_minmax_index_d', 'auto_minmax_index_d2', 'auto_minmax_index_m', 'auto_minmax_index_m2')
+ORDER BY name;
+"
+
 echo '--- stored definition ---'
 WORKING_DIR="${CLICKHOUSE_TMP:?}/${CLICKHOUSE_TEST_UNIQUE_NAME:?}"
 rm -rf "${WORKING_DIR}"
