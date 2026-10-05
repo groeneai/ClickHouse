@@ -240,12 +240,12 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     /// (tokenize first, then postprocess each token). Two cases:
     ///   - Array column: tokenize every element and flatten, mirroring tokenizeToArray which runs the
     ///     tokenizer per element. For the 'array' tokenizer this keeps each element as a single token; for
-    ///     any other tokenizer it splits multi-token elements (e.g. 'foo bar' -> 'foo', 'bar'). NULL elements are
-    ///     skipped first, as tokenizeToArray does.
-    ///   - Non-array column: tokenize the whole value with tokens(col, '<tokenizer>'); a NULL value yields no tokens.
+    ///     any other tokenizer it splits multi-token elements (e.g. 'foo bar' -> 'foo', 'bar').
+    ///   - Non-array column: tokenize the whole value with tokens(col, '<tokenizer>').
     /// tokens always yields String tokens (normalizing FixedString elements to String to match the build
     /// path and the postprocessor validation) and drops empty tokens, so an empty element never reaches the
     /// postprocessor and cannot fabricate a token the index never stored.
+    /// A NULL value or NULL array element yields no tokens, as in tokenizeToArray.
     ASTPtr tokenized_value_ast = source_ast ? source_ast->clone() : ASTPtr(make_intrusive<ASTIdentifier>(col_name));
     ASTPtr tokens_ast = tokenized_value_ast->clone();
     if (isArray(col_type))
