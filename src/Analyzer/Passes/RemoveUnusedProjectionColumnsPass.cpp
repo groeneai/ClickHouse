@@ -101,30 +101,33 @@ bool isLocalPhysicalTable(const StoragePtr & storage)
 }
 
 /// EXCEPT and INTERSECT compare the kept column, the next step of a recursive CTE reads it, INTERPOLATE refers to it
-/// by name, and it decides which ARRAY JOIN arrays are kept, whose sizes may differ. Other storages than MergeTree
-/// and Memory, such as a view or a remote table, may hide such an ARRAY JOIN.
+/// by name, and it decides which ARRAY JOIN arrays are kept, whose sizes may differ. MergeTree and Memory return the
+/// same rows whatever columns are read, other storages may not: a view or a remote table may hide such an ARRAY JOIN,
+/// `TimeSeries` builds its query from the columns, and `input_format_allow_errors_num` skips rows by the parsed columns.
 bool canReplaceKeptColumnWithConstant(const QueryTreeNodePtr & query_or_union_node)
 {
     auto * union_node = query_or_union_node->as<UnionNode>();
     if (!union_node)
     {
         const auto & query_node = query_or_union_node->as<QueryNode &>();
+        if (query_node.hasInterpolate())
+            return false;
+
         auto table_expressions = extractTableExpressions(query_node.getJoinTreeNodeTyped(), true /* add_array_join */, true /* recursive */);
-        return !query_node.hasInterpolate()
-            && std::all_of(table_expressions.begin(), table_expressions.end(), [](const auto & node)
+        return std::all_of(table_expressions.begin(), table_expressions.end(), [](const auto & node)
+        {
+            switch (node->getNodeType())
             {
-                switch (node->getNodeType())
-                {
-                    case QueryTreeNodeType::ARRAY_JOIN:
-                        return false;
-                    case QueryTreeNodeType::TABLE:
-                        return isLocalPhysicalTable(node->template as<TableNode &>().getStorage());
-                    case QueryTreeNodeType::TABLE_FUNCTION:
-                        return isLocalPhysicalTable(node->template as<TableFunctionNode &>().getStorage());
-                    default:
-                        return true;
-                }
-            });
+                case QueryTreeNodeType::ARRAY_JOIN:
+                    return false;
+                case QueryTreeNodeType::TABLE:
+                    return isLocalPhysicalTable(node->template as<TableNode &>().getStorage());
+                case QueryTreeNodeType::TABLE_FUNCTION:
+                    return isLocalPhysicalTable(node->template as<TableFunctionNode &>().getStorage());
+                default:
+                    return true;
+            }
+        });
     }
 
     const auto & queries = union_node->getQueries().getNodes();
