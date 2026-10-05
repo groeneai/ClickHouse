@@ -18,6 +18,10 @@ void checkHypotheticalProjectionIsAddable(
     bool if_not_exists,
     const ContextPtr & context);
 
+/// the capture check of a real `ADD INDEX`, after SQL UDFs are inlined, shared with `EXPLAIN WHATIF`
+void checkHypotheticalIndexAliasesNotCaptured(
+    const ASTPtr & index_decl, const ColumnsDescription & columns, const ContextPtr & context);
+
 class InterpreterHypotheticalObjectQuery : public IInterpreter, WithContext
 {
 public:

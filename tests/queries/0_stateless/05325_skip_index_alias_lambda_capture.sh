@@ -19,6 +19,10 @@ rejected "CREATE TABLE t_c4 (k UInt32, arr Array(UInt32), d UInt32 ALIAS k + 1,
     INDEX i arrayMax(arrayMap(k -> arrayMax(arrayMap(x -> d, arr)), arr)) TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
 rejected "CREATE TABLE t_c5 (k UInt32, arr Array(UInt32), d UInt32 ALIAS k + 1,
     INDEX i (k, arrayMax(arrayMap(k -> d, arr))) TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
+rejected "CREATE TABLE t_c6 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt32 ALIAS k + 1,
+    INDEX i arrayMax(arrayMap(t -> t.v, arr)) TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
+rejected "CREATE TABLE t_c7 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt32 ALIAS k + 1,
+    w UInt32 ALIAS arrayMax(arrayMap(t -> t.v, arr)), INDEX i w TYPE minmax) ENGINE = MergeTree ORDER BY tuple()"
 
 echo '--- not captured ---'
 $CLICKHOUSE_CLIENT --query "
@@ -38,6 +42,12 @@ SELECT name, expr FROM system.data_skipping_indices
 WHERE database = currentDatabase() AND table = 't_ok' AND creation = 'Explicit' ORDER BY name;
 INSERT INTO t_ok VALUES (5, [100]);
 SELECT arrayMax(arrayMap(x -> d, arr)) FROM t_ok;
+"
+$CLICKHOUSE_CLIENT --query "
+CREATE TABLE t_ok2 (k UInt32, arr Array(Tuple(v UInt32)), \`t.v\` UInt32 ALIAS k + 1,
+    INDEX i arrayMax(arrayMap(x -> t.v, arr)) TYPE minmax) ENGINE = MergeTree ORDER BY tuple();
+SELECT name, expr FROM system.data_skipping_indices
+WHERE database = currentDatabase() AND table = 't_ok2' AND creation = 'Explicit' ORDER BY name;
 "
 
 echo '--- ALTER ---'
@@ -67,6 +77,27 @@ ALTER TABLE t_alter ADD INDEX n arrayMax(arrayMap(x -> e, arr)) TYPE minmax;
 ALTER TABLE t_alter RENAME COLUMN k TO k2;
 SELECT name, expr FROM system.data_skipping_indices
 WHERE database = currentDatabase() AND table = 't_alter' AND creation = 'Explicit' ORDER BY name;
+"
+
+echo '--- EXPLAIN WHATIF rebuild ---'
+whatif_rejected() { $CLICKHOUSE_CLIENT --query "$1" 2>&1 | grep -c -m 1 "no longer matches the current table schema: ALIAS column 'd' cannot be expanded inside a lambda"; }
+$CLICKHOUSE_CLIENT --query "
+CREATE TABLE t_whatif_udf (k UInt32, arr Array(UInt32), d UInt32 ALIAS k + 1) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
+INSERT INTO t_whatif_udf (k, arr) SELECT number, [toUInt32(number + 100)] FROM numbers(20);
+CREATE TABLE t_whatif_alias (k UInt32, arr Array(UInt32), d UInt32 ALIAS 1) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
+INSERT INTO t_whatif_alias (k, arr) SELECT number, [toUInt32(number + 100)] FROM numbers(20);
+"
+whatif_rejected "
+CREATE FUNCTION ${CLICKHOUSE_DATABASE}_wf AS (x, xs) -> arrayMax(arrayMap(q -> x, xs));
+CREATE HYPOTHETICAL INDEX h ON t_whatif_udf (${CLICKHOUSE_DATABASE}_wf(d, arr)) TYPE minmax;
+CREATE OR REPLACE FUNCTION ${CLICKHOUSE_DATABASE}_wf AS (x, xs) -> arrayMax(arrayMap(k -> x, xs));
+EXPLAIN WHATIF empirical = 0 SELECT * FROM t_whatif_udf WHERE arrayMax(arrayMap(k -> k + 1, arr)) > 115;
+"
+$CLICKHOUSE_CLIENT --query "DROP FUNCTION IF EXISTS ${CLICKHOUSE_DATABASE}_wf"
+whatif_rejected "
+CREATE HYPOTHETICAL INDEX h ON t_whatif_alias (arrayMax(arrayMap(k -> d, arr))) TYPE minmax;
+ALTER TABLE t_whatif_alias MODIFY COLUMN d UInt32 ALIAS k + 1;
+EXPLAIN WHATIF empirical = 0 SELECT * FROM t_whatif_alias WHERE arrayMax(arrayMap(k -> k + 1, arr)) > 115;
 "
 
 echo '--- automatic minmax index ---'

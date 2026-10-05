@@ -207,7 +207,7 @@ void IndexDescription::checkAliasesNotCapturedByLambda(const ASTPtr & definition
     using ReplaceAliasToExprVisitor = InDepthNodeVisitor<ReplaceAliasByExpressionMatcher, true>;
     /// extractKeyExpressionList returns a copy, the visitor rewrites it.
     ASTPtr expr_list = extractKeyExpressionList(index_definition->getExpression());
-    ReplaceAliasToExprVisitor::Data data{columns, {}, /*reject_lambda_capture=*/ true};
+    ReplaceAliasToExprVisitor::Data data{columns, {}, /*reject_lambda_capture=*/ true, /*reject_lambda_parameter_prefix=*/ true};
     try
     {
         ReplaceAliasToExprVisitor{data}.visit(expr_list);

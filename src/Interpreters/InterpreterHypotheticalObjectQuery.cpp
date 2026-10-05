@@ -118,11 +118,7 @@ BlockIO createHypotheticalIndex(
         /* is_implicitly_created = */ false,
         /* escape_filenames = */ true,
         context);
-    /// CREATE and ALTER check the declaration after SQL UDFs are inlined.
-    ASTPtr checked_declaration = query.index_decl->clone();
-    if (!UserDefinedSQLFunctionFactory::instance().empty())
-        UserDefinedSQLFunctionVisitor::visit(checked_declaration, context);
-    IndexDescription::checkAliasesNotCapturedByLambda(checked_declaration, metadata->getColumns());
+    checkHypotheticalIndexAliasesNotCaptured(query.index_decl, metadata->getColumns(), context);
 
     /// Empirical estimation reads the index's columns, so require column-level
     /// SELECT — otherwise a user with table-level access could infer a restricted
@@ -210,6 +206,15 @@ void checkHypotheticalProjectionIsAddable(
     /// the eligibility check applies the commands, which requires prepare first
     commands.prepare(*metadata, (*merge_tree.getSettings())[MergeTreeSetting::share_nested_offsets]);
     merge_tree.checkAlterEligibility(commands, context);
+}
+
+void checkHypotheticalIndexAliasesNotCaptured(
+    const ASTPtr & index_decl, const ColumnsDescription & columns, const ContextPtr & context)
+{
+    ASTPtr checked_declaration = index_decl->clone();
+    if (!UserDefinedSQLFunctionFactory::instance().empty())
+        UserDefinedSQLFunctionVisitor::visit(checked_declaration, context);
+    IndexDescription::checkAliasesNotCapturedByLambda(checked_declaration, columns);
 }
 
 BlockIO InterpreterHypotheticalObjectQuery::execute()
