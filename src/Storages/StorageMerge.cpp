@@ -538,8 +538,7 @@ bool sharesNestedOffsets(const StorageSnapshotPtr & snapshot)
     return true;
 }
 
-/// The column of the child that a missing array `column` (a name in storage, as declared in the `Merge` table) takes
-/// its sizes from: an array of the same `Nested` group, the way `addMissingDefaults` and `MergeTree` fill it.
+/// The child's array of the same `Nested` group that a missing array `column` (a name in storage) takes its sizes from.
 std::optional<NameAndTypePair> getNestedSiblingForSizes(
     const NameAndTypePair & column, const ColumnsDescription & child_columns, bool shares_nested_offsets)
 {
