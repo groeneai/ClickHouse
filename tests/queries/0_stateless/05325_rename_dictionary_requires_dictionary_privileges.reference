@@ -7,6 +7,11 @@ ACCESS_DENIED
 ACCESS_DENIED
 ACCESS_DENIED
 ACCESS_DENIED
+-- each side of a move needs its own dictionary privilege
+ACCESS_DENIED
+ACCESS_DENIED
+ACCESS_DENIED
+ACCESS_DENIED
 -- on a cluster, a name this host does not have may be a dictionary on another host
 ACCESS_DENIED
 -- a JSON query cannot set the interpreter-only mode that turns a rename into an exchange

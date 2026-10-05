@@ -9,6 +9,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 user="user_${CLICKHOUSE_TEST_UNIQUE_NAME}"
 partial="partial_${CLICKHOUSE_TEST_UNIQUE_NAME}"
+drop_less="drop_less_${CLICKHOUSE_TEST_UNIQUE_NAME}"
+create_less="create_less_${CLICKHOUSE_TEST_UNIQUE_NAME}"
 db="atomic_${CLICKHOUSE_DATABASE}"
 repl_db="repl_${CLICKHOUSE_DATABASE}"
 lazy_db="lazy_${CLICKHOUSE_DATABASE}"
@@ -35,6 +37,10 @@ CREATE USER ${partial} IDENTIFIED WITH plaintext_password BY '${partial}';
 GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE ON ${db}.* TO ${partial};
 GRANT DROP DICTIONARY ON ${db}.d2 TO ${partial};
 GRANT CREATE DICTIONARY, DROP DICTIONARY ON ${db}.tmp TO ${partial};
+CREATE USER ${drop_less} IDENTIFIED WITH plaintext_password BY '${drop_less}';
+GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, CREATE DICTIONARY ON ${db}.* TO ${drop_less};
+CREATE USER ${create_less} IDENTIFIED WITH plaintext_password BY '${create_less}';
+GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, DROP DICTIONARY ON ${db}.* TO ${create_less};
 "
 
 # Runs a query as a user (extra client options after it) and prints ACCESS_DENIED, BAD_ARGUMENTS, OK, or the output.
@@ -59,6 +65,12 @@ run "$user" "EXCHANGE TABLES ${db}.t AND ${db}.d"
 run "$user" "RENAME TABLE ${repl_db}.d TO ${repl_db}.d_moved"
 run "$user" "EXCHANGE TABLES ${db}.t AND ${db}.d ON CLUSTER test_shard_localhost"
 run "$user" "RENAME TABLE ${lazy_db}.w TO ${lazy_db}.w_moved"
+
+echo "-- each side of a move needs its own dictionary privilege"
+run "$drop_less" "RENAME TABLE ${db}.d TO ${db}.d_moved"
+run "$create_less" "RENAME TABLE ${db}.d TO ${db}.d_moved"
+run "$drop_less" "EXCHANGE TABLES ${db}.t AND ${db}.d"
+run "$create_less" "EXCHANGE TABLES ${db}.t AND ${db}.d"
 
 echo "-- on a cluster, a name this host does not have may be a dictionary on another host"
 run "$user" "RENAME TABLE ${db}.absent TO ${db}.y ON CLUSTER test_shard_localhost"
@@ -91,5 +103,5 @@ WHERE database IN ('${db}', '${repl_db}') ORDER BY database = '${db}' DESC, name
 DROP DATABASE ${lazy_db};
 DROP DATABASE ${db};
 DROP DATABASE ${repl_db};
-DROP USER ${user}, ${partial};
+DROP USER ${user}, ${partial}, ${drop_less}, ${create_less};
 "
