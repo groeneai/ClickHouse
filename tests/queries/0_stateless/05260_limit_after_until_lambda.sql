@@ -8,6 +8,9 @@ SELECT number, arraySum(x -> x, range(number)) FROM numbers(6) LIMIT AFTER array
 -- The boundary expression does not use the lambda.
 SELECT number, arraySum(x -> x, range(number)) FROM numbers(6) LIMIT AFTER number > 2;
 
+-- A JIT-compiled expression next to a constant lambda in the SELECT list.
+SELECT (number > 3) AND arrayExists(x -> (x >= NULL), [number]), number FROM numbers(10) LIMIT UNTIL number > 5 SETTINGS compile_expressions = 1, min_count_to_compile_expression = 0;
+
 -- Not a reproduction, this shape works without the fix: an IN subquery in both the SELECT list and the boundary.
 SELECT number, number IN (SELECT 3) FROM numbers(6) LIMIT AFTER (number + 1) IN (SELECT 3);
 
