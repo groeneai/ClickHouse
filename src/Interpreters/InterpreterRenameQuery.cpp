@@ -300,7 +300,6 @@ AccessRightsElements InterpreterRenameQuery::getRequiredAccessForDictionaries(co
     const auto & rename = query_ptr->as<const ASTRenameQuery &>();
 
     /// The table privileges imply the view ones but not the dictionary ones, and `RENAME TABLE` moves a dictionary too.
-    /// What a name holds after the earlier elements: nothing (nullopt), or whether it may be a dictionary.
     std::map<UniqueTableName, std::optional<bool>> moved;
     auto may_be_dictionary = [&](const UniqueTableName & name) -> std::optional<bool>
     {
