@@ -62,3 +62,19 @@ tn_map NOT	[2]
 7. Direct read with a part where the index is not materialized.
 tp_partial	[2,12]
 tp_partial direct read	1
+8. Array(Nullable(FixedString)) and Map values: a NULL element must not produce tokens.
+tp_afs	1	0	0
+tp_afs	2	0	0
+tp_afs	3	0	0
+tp_afs	4	0	0
+tp_afs	5	1	1
+tn_afs	1	0	0
+tn_afs	2	0	0
+tn_afs	3	0	0
+tn_afs	4	0	0
+tn_afs	5	1	1
+tp_afs WHERE	[5]
+tn_afs WHERE	[5]
+tp_afs index	[5]
+tp_mfs WHERE	[5]
+tn_mfs WHERE	[5]

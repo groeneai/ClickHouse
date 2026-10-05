@@ -2,8 +2,10 @@
 
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnString.h>
+#include <Common/assert_cast.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ExpressionActions.h>
@@ -238,7 +240,8 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     /// (tokenize first, then postprocess each token). Two cases:
     ///   - Array column: tokenize every element and flatten, mirroring tokenizeToArray which runs the
     ///     tokenizer per element. For the 'array' tokenizer this keeps each element as a single token; for
-    ///     any other tokenizer it splits multi-token elements (e.g. 'foo bar' -> 'foo', 'bar').
+    ///     any other tokenizer it splits multi-token elements (e.g. 'foo bar' -> 'foo', 'bar'). NULL elements are
+    ///     skipped first, as tokenizeToArray does.
     ///   - Non-array column: tokenize the whole value with tokens(col, '<tokenizer>').
     /// tokens always yields String tokens (normalizing FixedString elements to String to match the build
     /// path and the postprocessor validation) and drops empty tokens, so an empty element never reaches the
@@ -247,6 +250,14 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     ASTPtr tokens_ast = tokenized_value_ast->clone();
     if (isArray(col_type))
     {
+        const bool skip_null_elements
+            = source_ast || isNullableOrLowCardinalityNullable(assert_cast<const DataTypeArray &>(*col_type).getNestedType());
+        if (skip_null_elements)
+            tokens_ast = makeASTFunction("arrayFilter",
+                makeASTLambda({postprocessor_element_arg},
+                    makeASTFunction("isNotNull", make_intrusive<ASTIdentifier>(postprocessor_element_arg))),
+                std::move(tokens_ast));
+
         tokens_ast = makeASTFunction("arrayFlatten",
             makeASTFunction("arrayMap",
                 makeASTLambda({postprocessor_element_arg},

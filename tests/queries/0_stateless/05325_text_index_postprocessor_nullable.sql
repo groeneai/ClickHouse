@@ -17,6 +17,10 @@ DROP TABLE IF EXISTS tn_fs;
 DROP TABLE IF EXISTS tp_map;
 DROP TABLE IF EXISTS tn_map;
 DROP TABLE IF EXISTS tp_partial;
+DROP TABLE IF EXISTS tp_afs;
+DROP TABLE IF EXISTS tn_afs;
+DROP TABLE IF EXISTS tp_mfs;
+DROP TABLE IF EXISTS tn_mfs;
 
 SELECT '1. Nullable(String), no preprocessor.';
 
@@ -135,6 +139,29 @@ SELECT 'tp_partial', arraySort(groupArray(id)) FROM tp_partial WHERE hasAnyToken
 SELECT 'tp_partial direct read', countIf(position(explain, '__text_index_tix_hasAnyTokens_') > 0) > 0
 FROM (EXPLAIN actions = 1 SELECT id FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1);
 
+SELECT '8. Array(Nullable(FixedString)) and Map values: a NULL element must not produce tokens.';
+
+CREATE TABLE tp_afs (id UInt32, a Array(Nullable(FixedString(6))), INDEX tix a TYPE text(tokenizer = ngrams(3), postprocessor = if(match(a, '[a-z]'), a, '#')))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tn_afs (id UInt32, a Array(Nullable(FixedString(6))), INDEX tix a TYPE text(tokenizer = ngrams(3)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+INSERT INTO tp_afs VALUES (1, [NULL]), (2, ['hello']), (3, [NULL, 'hello']), (4, []), (5, ['12345']);
+INSERT INTO tn_afs VALUES (1, [NULL]), (2, ['hello']), (3, [NULL, 'hello']), (4, []), (5, ['12345']);
+SELECT 'tp_afs', id, hasAnyTokens(a, '123'), hasAllTokens(a, '123') FROM tp_afs ORDER BY id SETTINGS use_skip_indexes = 0;
+SELECT 'tn_afs', id, hasAnyTokens(a, '123'), hasAllTokens(a, '123') FROM tn_afs ORDER BY id SETTINGS use_skip_indexes = 0;
+SELECT 'tp_afs WHERE', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 0;
+SELECT 'tn_afs WHERE', arraySort(groupArray(id)) FROM tn_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 0;
+SELECT 'tp_afs index', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1;
+
+CREATE TABLE tp_mfs (id UInt32, m Map(String, Nullable(FixedString(6))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3), postprocessor = if(match(mapValues(m), '[a-z]'), mapValues(m), '#')))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tn_mfs (id UInt32, m Map(String, Nullable(FixedString(6))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+INSERT INTO tp_mfs VALUES (1, map()), (2, map('k', 'hello')), (3, map('k', NULL)), (4, map('j', NULL, 'k', 'hello')), (5, map('k', '12345'));
+INSERT INTO tn_mfs VALUES (1, map()), (2, map('k', 'hello')), (3, map('k', NULL)), (4, map('j', NULL, 'k', 'hello')), (5, map('k', '12345'));
+SELECT 'tp_mfs WHERE', arraySort(groupArray(id)) FROM tp_mfs WHERE hasAnyTokens(mapValues(m), '123') SETTINGS use_skip_indexes = 0;
+SELECT 'tn_mfs WHERE', arraySort(groupArray(id)) FROM tn_mfs WHERE hasAnyTokens(mapValues(m), '123') SETTINGS use_skip_indexes = 0;
+
 DROP TABLE tp;
 DROP TABLE tn;
 DROP TABLE tp_lower;
@@ -151,3 +178,7 @@ DROP TABLE tn_fs;
 DROP TABLE tp_map;
 DROP TABLE tn_map;
 DROP TABLE tp_partial;
+DROP TABLE tp_afs;
+DROP TABLE tn_afs;
+DROP TABLE tp_mfs;
+DROP TABLE tn_mfs;
