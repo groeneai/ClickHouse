@@ -2570,8 +2570,8 @@ void loadFuzzerServerSettings(const FuzzConfig & fc)
               CHSetting(
                   [&](RandomGenerator & rg, FuzzConfig &)
                   {
-                      /// The first release with the analyzer enabled
-                      const uint32_t minYear = 24;
+                      /// The oldest supported release
+                      const uint32_t minYear = 26;
                       const uint32_t minMonth = 3;
                       const std::chrono::year_month_day ymd{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now())};
                       const uint32_t currentYear
@@ -2579,7 +2579,7 @@ void loadFuzzerServerSettings(const FuzzConfig & fc)
                       const uint32_t currentMonth = static_cast<uint32_t>(ymd.month()); /// 1–12
 
                       /// Map (year, month) to a linear month index
-                      const uint32_t startIndex = minYear * 12 + (minMonth - 1); /// 24.3
+                      const uint32_t startIndex = minYear * 12 + (minMonth - 1); /// 26.3
                       const uint32_t total = (currentYear * 12 + (currentMonth - 1)) - startIndex + 1;
                       const uint32_t randomIndex = startIndex + rg.randomInt<uint32_t>(0, total - 1);
                       /// Convert back from linear month index to (year, month)

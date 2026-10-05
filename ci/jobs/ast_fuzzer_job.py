@@ -368,16 +368,14 @@ def run_fuzz_job(check_name: str):
     compatibility_setting: str | None = None
     if not buzzhouse:
         if is_old_compatibility:
-            # 24.3 is the oldest compatibility version worth fuzzing: it is where the
-            # analyzer became the default, so an older one asks for the behavior of a
-            # release that predates the only query analysis there is now.
-            compatibility_setting = "24.3"
+            # 26.3 is the oldest supported release (SECURITY.md).
+            compatibility_setting = "26.3"
         elif is_targeted:
             compatibility_setting = None
         else:
-            compatibility_setting = (
-                f"{random.randint(24, 27)}.{random.randint(1, 12)}"
-            )
+            # A uniform month in 26.3..27.12.
+            month = random.randint(26 * 12 + 2, 27 * 12 + 11)
+            compatibility_setting = f"{month // 12}.{month % 12 + 1}"
         if compatibility_setting:
             logging.info("AST fuzzer compatibility setting: %s", compatibility_setting)
         else:

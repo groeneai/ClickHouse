@@ -16,9 +16,9 @@
                     test ignores `no-*` build tags and runs the fuzzer over every query.
 
                     `max_parser_backtracks` is additionally pinned on the client command line
-                    (run-fuzzer.sh, stress.py): its pre-24.3 default is 0, so a client
-                    `compatibility=...` reverts it to 0 and sends that to the server, which a
-                    value in this profile cannot prevent (the client value wins).
+                    (run-fuzzer.sh, stress.py): the client parses queries locally, and a client
+                    `compatibility=...` older than 24.3 reverts it there to 0 (unbounded), which
+                    a value in this profile cannot prevent.
                 -->
                 <max_ast_depth>
                     <min>1</min>

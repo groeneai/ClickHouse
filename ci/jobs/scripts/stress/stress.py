@@ -546,10 +546,9 @@ def get_options(i: int, upgrade_check: bool, encrypted_storage: bool) -> str:
             f"query_plan_optimize_join_order_limit={random.randint(0, 64)}"
         )
 
+    # 26.3 is the oldest supported release (SECURITY.md).
     if random.random() < 0.2 and not upgrade_check:
-        client_options.append(
-            f"compatibility='{random.randint(20, 26)}.{random.randint(1, 12)}'"
-        )
+        client_options.append(f"compatibility='26.{random.randint(3, 12)}'")
 
     if random.random() < 0.3:
         options.append("--replace-log-memory-with-mergetree")
@@ -623,10 +622,8 @@ def get_options(i: int, upgrade_check: bool, encrypted_storage: bool) -> str:
         f"query_plan_optimize_join_order_algorithm={random.choice(join_order_algorithm_combinations)}"
     )
 
-    # Pin max_parser_backtracks on the client command line. Its pre-24.3 default is 0, so the
-    # randomized compatibility='NN.N' above reverts it to 0 in the client, which then sends 0 to
-    # the server and trips the <min>1</min> limit-recursion constraint on every query. A
-    # command-line value survives applyCompatibilitySetting, unlike a users.d profile value.
+    # The client parses queries locally, and a test's own `SET compatibility` older than 24.3
+    # reverts `max_parser_backtracks` there to 0 (unbounded); a command-line value survives that.
     client_options.append("max_parser_backtracks=1000000")
 
     if client_options:
