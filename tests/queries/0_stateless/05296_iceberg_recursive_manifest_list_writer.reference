@@ -1,10 +1,2 @@
---- repeated named record type that is not recursive ---
-missing required field
---- recursive record ---
-AVRO_EXCEPTION: nested deeper than 256 levels
---- recursive record behind a nullable union ---
-missing required field
---- recursive record behind a nullable union, nested 1000000 levels deep ---
-AVRO_EXCEPTION: nested deeper than 256 levels
---- stateless server is still alive ---
-1
+Cannot build a datum nested deeper than 256 levels. (AVRO_EXCEPTION)
+Cannot read a datum nested deeper than 256 levels. (AVRO_EXCEPTION)

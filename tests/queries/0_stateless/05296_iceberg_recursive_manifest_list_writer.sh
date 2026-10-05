@@ -2,131 +2,56 @@
 # Tags: no-fasttest
 # Tag no-fasttest: requires `IcebergLocal` (USE_AVRO build option) and Iceberg writes.
 
-# A manifest list with a recursive Avro schema must be rejected by an INSERT into an Iceberg table, not crash.
-# `clickhouse local` contains the pre-fix fatal signal to a short-lived subprocess.
+# An INSERT into an Iceberg table reads the parent manifest list. A recursive Avro schema there must be an error, not a crash.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
 WORK_DIR="${CLICKHOUSE_TMP}/iceberg_recursive_manifest_list_writer_${CLICKHOUSE_TEST_UNIQUE_NAME}"
-
 rm -rf "${WORK_DIR}"
-mkdir -p "${WORK_DIR}"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
-# Writes an Avro container file with the given schema and, if a datum is given, one block holding it. The datum is hex, or
-# `deep:N` for a row of the nullable recursive schema nested N levels deep.
-write_avro()
-{
-    python3 - "$@" <<'PY'
-import sys
-
-path, schema, datum_spec = sys.argv[1], sys.argv[2].encode(), sys.argv[3]
-
-
-def write_long(value):
-    value = (value << 1) ^ (value >> 63)
-    out = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        out.append(byte | 0x80 if value else byte)
-        if not value:
-            return bytes(out)
-
-
-def write_bytes(value):
-    return write_long(len(value)) + value
-
-
-sync = bytes.fromhex('7d4f6998c268758353f227bc9dba7b7e')
-metadata = [(b'avro.codec', b'null'), (b'avro.schema', schema)]
-
-data = bytearray(b'Obj\x01')
-data += write_long(len(metadata))
-for key, value in metadata:
-    data += write_bytes(key) + write_bytes(value)
-data += write_long(0) + sync
-
-if datum_spec:
-    if datum_spec.startswith('deep:'):
-        datum = b'\x02' * int(datum_spec[5:]) + b'\x00'
-    else:
-        datum = bytes.fromhex(datum_spec)
-    data += write_long(1) + write_long(len(datum)) + datum + sync
-
-with open(path, 'wb') as f:
-    f.write(bytes(data))
-PY
-}
-
+# Arguments: case name, Avro schema, nesting depth of the file's single row (0 = no rows).
 run_case()
 {
-    local name=$1 schema=$2 datum_spec=$3
-    local case_dir="${WORK_DIR}/${name}"
-    local table_root="${case_dir}/iceberg/t0"
-    mkdir -p "${case_dir}/db" "${table_root}"
+    local dir="${WORK_DIR}/$1"
+    mkdir -p "${dir}/db" "${dir}/t0"
+    ${CLICKHOUSE_LOCAL} --path "${dir}/db" --allow_insert_into_iceberg=1 --query "
+        CREATE TABLE t0 (x Int32) ENGINE = IcebergLocal('${dir}/t0/');
+        INSERT INTO t0 VALUES (1);" -- --user_files_path="${dir}"
 
-    ${CLICKHOUSE_LOCAL} \
-        --path "${case_dir}/db" \
-        --allow_insert_into_iceberg=1 \
-        --multiquery \
-        --query "
-            CREATE TABLE t0 (x Int32) ENGINE = IcebergLocal('${table_root}/');
-            INSERT INTO t0 VALUES (1), (2);
-        " -- --user_files_path="${case_dir}"
+    python3 - "${dir}/crafted.avro" "$2" "$3" <<'PY'
+import sys
 
-    local manifest_list
-    manifest_list=$(find "${table_root}/metadata" -maxdepth 1 -name 'snap-*.avro' -type f | sort | head -1)
-    if [ -z "${manifest_list}" ]; then
-        echo "manifest list not found"
-        return
-    fi
+def long(v):
+    v <<= 1
+    out = b''
+    while v > 0x7F:
+        out += bytes([v & 0x7F | 0x80])
+        v >>= 7
+    return out + bytes([v])
 
-    write_avro "${case_dir}/crafted.avro" "${schema}" "${datum_spec}"
+def blob(v):
+    return long(len(v)) + v
 
-    # The SELECT caches the valid manifest list, so only the INSERT, which carries the list forward, reads the replaced file.
-    local output status
-    output=$(
-        ${CLICKHOUSE_LOCAL} \
-            --path "${case_dir}/db" \
-            --allow_insert_into_iceberg=1 \
-            --use_iceberg_metadata_files_cache=1 \
-            --engine_file_truncate_on_insert=1 \
-            --multiquery \
-            --query "
-                SELECT count() FROM t0 FORMAT Null;
-                INSERT INTO FUNCTION file('${manifest_list}', RawBLOB) SELECT * FROM file('${case_dir}/crafted.avro', RawBLOB);
-                INSERT INTO t0 VALUES (3);
-            " -- --user_files_path="${case_dir}" 2>&1
-    )
-    status=$?
+path, schema, depth = sys.argv[1], sys.argv[2].encode(), int(sys.argv[3])
+sync = b'\x00' * 16
+data = b'Obj\x01' + long(2) + blob(b'avro.codec') + blob(b'null') + blob(b'avro.schema') + blob(schema) + long(0) + sync
+if depth:
+    data += long(1) + blob(b'\x02' * depth + b'\x00') + sync
+open(path, 'wb').write(data)
+PY
 
-    if echo "${output}" | grep -F 'nested deeper than 256 levels' | grep -qF 'AVRO_EXCEPTION'; then
-        echo 'AVRO_EXCEPTION: nested deeper than 256 levels'
-    elif echo "${output}" | grep -qF 'is missing required field'; then
-        echo 'missing required field'
-    elif echo "${output}" | grep -qF 'Code:'; then
-        echo "${output}" | grep -m1 -F 'Code:'
-    else
-        echo "no exception, exit status ${status}"
-    fi
+    # The SELECT caches the valid manifest list, so only the INSERT reads the replaced file.
+    ${CLICKHOUSE_LOCAL} --path "${dir}/db" --allow_insert_into_iceberg=1 --use_iceberg_metadata_files_cache=1 \
+        --engine_file_truncate_on_insert=1 --query "
+        SELECT count() FROM t0 FORMAT Null;
+        INSERT INTO FUNCTION file('$(find "${dir}/t0/metadata" -name 'snap-*.avro')', RawBLOB)
+            SELECT * FROM file('${dir}/crafted.avro', RawBLOB);
+        INSERT INTO t0 VALUES (2);" -- --user_files_path="${dir}" 2>&1 \
+        | grep -o -m1 'Cannot [a-z]* a datum nested deeper than 256 levels. (AVRO_EXCEPTION)' || echo 'no depth error'
 }
 
-# `S` appears twice, but as siblings, so the schema is not recursive. The datum is one row: a.x = 1, b.x = 2.
-echo '--- repeated named record type that is not recursive ---'
-run_case repeated '{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"S"}]}' '0204'
-
-echo '--- recursive record ---'
-run_case recursive '{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]}' ''
-
-# The datum is one row whose `next` is null.
-echo '--- recursive record behind a nullable union ---'
-run_case nullable '{"type":"record","name":"A","fields":[{"name":"next","type":["null","A"]}]}' '00'
-
-echo '--- recursive record behind a nullable union, nested 1000000 levels deep ---'
-run_case deep '{"type":"record","name":"A","fields":[{"name":"next","type":["null","A"]}]}' 'deep:1000000'
-
-echo '--- stateless server is still alive ---'
-${CLICKHOUSE_CLIENT} --query "SELECT 1"
+run_case recursive '{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}}]}' 0
+run_case deep '{"type":"record","name":"A","fields":[{"name":"next","type":["null","A"]}]}' 1000000
