@@ -94,6 +94,20 @@ namespace
         new_context->setSetting("input_format_custom_detect_header", false);
         return new_context;
     }
+
+    /// The macOS watcher compares the files that the names lead to, so it also reports a replaced symlink target.
+#if defined(OS_DARWIN)
+    constexpr bool watcher_reports_replaced_targets = true;
+#else
+    constexpr bool watcher_reports_replaced_targets = false;
+#endif
+
+    /// 0 if the entry cannot be read.
+    UInt64 getEntryInode(const String & path)
+    {
+        struct stat entry_stat{};
+        return lstat(path.c_str(), &entry_stat) == 0 ? entry_stat.st_ino : 0;
+    }
 }
 
 static constexpr auto TMP_SUFFIX = ".tmp";
@@ -379,7 +393,7 @@ void StorageFileLog::loadFiles()
             /// A name added in the first pass has its inode in the set, so it is not visited again after the move.
             if (!inodes_with_name.insert(file.second).second)
                 continue;
-            file_infos.context_by_name.emplace(file.first, FileContext{.inode = file.second});
+            file_infos.context_by_name.emplace(file.first, FileContext{.inode = file.second, .entry_inode = getEntryInode(getFullDataPath(file.first))});
             file_infos.file_names.push_back(std::move(file.first));
         }
     };
@@ -589,6 +603,29 @@ bool StorageFileLog::isTrackedByDirectoryEvents(const String & file_name) const
     return directory_watch && !FS::isSymlinkNoThrow(getFullDataPath(file_name));
 }
 
+bool StorageFileLog::rekeyIfNoEvent(const String & file_name, FileContext & file_ctx)
+{
+    const String file_path = getFullDataPath(file_name);
+    struct stat file_stat{};
+    struct stat entry_stat{};
+    /// Without a watcher, or with inotify for a symlink whose own entry did not change (its target was replaced), no
+    /// event re-keys a name that leads to another file.
+    if (stat(file_path.c_str(), &file_stat) == 0 && file_stat.st_ino != file_ctx.inode
+        && (!directory_watch
+            || (!watcher_reports_replaced_targets && lstat(file_path.c_str(), &entry_stat) == 0 && S_ISLNK(entry_stat.st_mode)
+                && entry_stat.st_ino == file_ctx.entry_inode)))
+    {
+        /// A file the table reads under another name is not read again.
+        if (file_infos.meta_by_inode.contains(file_stat.st_ino))
+            return false;
+        file_infos.meta_by_inode.erase(file_ctx.inode);
+        disk->removeFileIfExists(getFullMetaPath(file_name));
+        file_ctx.inode = file_stat.st_ino;
+        file_infos.meta_by_inode.emplace(file_ctx.inode, FileMeta{.file_name = file_name});
+    }
+    return true;
+}
+
 void StorageFileLog::openFilesAndSetPos()
 {
     bool any_open_failed = false;
@@ -597,7 +634,28 @@ void StorageFileLog::openFilesAndSetPos()
         auto & file_ctx = findInMap(file_infos.context_by_name, file);
         if (file_ctx.status != FileStatus::NO_CHANGE || file_ctx.open_failed)
         {
-            file_ctx.reader.emplace(getFullDataPath(file));
+            /// Not read this poll; a file whose open failed before is retried.
+            auto skip_file = [&]
+            {
+                file_ctx.reader.reset();
+                file_ctx.status = FileStatus::NO_CHANGE;
+                if (file_ctx.open_failed)
+                {
+                    any_open_failed = true;
+                    has_files_to_reopen = true;
+                }
+            };
+
+            if (!rekeyIfNoEvent(file, file_ctx))
+            {
+                skip_file();
+                continue;
+            }
+
+            const String file_path = getFullDataPath(file);
+            struct stat file_stat{};
+
+            file_ctx.reader.emplace(file_path);
             const int open_errno = errno;
             if (!file_ctx.reader->is_open() && open_errno == ENOENT && isTrackedByDirectoryEvents(file))
             {
@@ -610,7 +668,7 @@ void StorageFileLog::openFilesAndSetPos()
                 && (open_errno == ENOENT || open_errno == EACCES || open_errno == EPERM || open_errno == ELOOP))
             {
                 if (!file_ctx.open_failed)
-                    LOG_ERROR(log, "Cannot open file {}, will retry: {}", getFullDataPath(file), errnoToString(open_errno));
+                    LOG_ERROR(log, "Cannot open file {}, will retry: {}", file_path, errnoToString(open_errno));
                 file_ctx.reader.reset();
                 file_ctx.status = FileStatus::NO_CHANGE;
                 file_ctx.open_failed = true;
@@ -631,24 +689,18 @@ void StorageFileLog::openFilesAndSetPos()
             }
             auto & reader = file_ctx.reader.value();
             assertStreamGood(reader);
+            /// Read only if the path leads to the file the offset is kept for; a replaced entry is re-keyed by its
+            /// directory events.
+            if (stat(file_path.c_str(), &file_stat) != 0 || file_stat.st_ino != file_ctx.inode)
+            {
+                /// Without directory events, the next poll looks again.
+                if (!isTrackedByDirectoryEvents(file))
+                    file_ctx.open_failed = true;
+                skip_file();
+                continue;
+            }
             if (file_ctx.open_failed)
             {
-                /// The path may lead to another file now: read it from the start.
-                if (const UInt64 inode = getInode(getFullDataPath(file)); inode != file_ctx.inode)
-                {
-                    if (isTrackedByDirectoryEvents(file))
-                    {
-                        file_ctx.reader.reset();
-                        file_ctx.status = FileStatus::NO_CHANGE;
-                        any_open_failed = true;
-                        has_files_to_reopen = true;
-                        continue;
-                    }
-                    file_infos.meta_by_inode.erase(file_ctx.inode);
-                    disk->removeFileIfExists(getFullMetaPath(file));
-                    file_ctx.inode = inode;
-                    file_infos.meta_by_inode.insert_or_assign(inode, FileMeta{.file_name = file});
-                }
                 file_ctx.open_failed = false;
                 file_ctx.status = FileStatus::UPDATED;
             }
@@ -1207,7 +1259,7 @@ void StorageFileLog::onFileAppeared(const String & file_name, UInt64 inode)
     if (it == file_infos.context_by_name.end())
     {
         file_infos.file_names.push_back(file_name);
-        file_infos.context_by_name.emplace(file_name, FileContext{.inode = inode});
+        file_infos.context_by_name.emplace(file_name, FileContext{.inode = inode, .entry_inode = getEntryInode(getFullDataPath(file_name))});
         return;
     }
     if (it->second.inode != inode)
@@ -1219,7 +1271,7 @@ void StorageFileLog::onFileAppeared(const String & file_name, UInt64 inode)
             disk->removeFileIfExists(getFullMetaPath(file_name));
         }
     }
-    it->second = FileContext{.inode = inode};
+    it->second = FileContext{.inode = inode, .entry_inode = getEntryInode(getFullDataPath(file_name))};
 }
 
 bool StorageFileLog::fileNameMatches(const String & file_name) const
@@ -1468,6 +1520,9 @@ void StorageFileLog::resetReadPosition(const std::optional<String> & file_name, 
 
         auto add_target = [&](const String & name, FileContext & file_ctx, UInt64 new_offset)
         {
+            /// The offset is for the file the name leads to now; a file read under another name is not read under this one.
+            if (!rekeyIfNoEvent(name, file_ctx))
+                return;
             FileMeta new_meta = findInMap(file_infos.meta_by_inode, file_ctx.inode);
             new_meta.last_writen_position = new_offset;
             targets.push_back({name, &file_ctx, std::move(new_meta)});
