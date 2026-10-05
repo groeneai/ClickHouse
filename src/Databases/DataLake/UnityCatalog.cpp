@@ -324,8 +324,7 @@ void UnityCatalog::checkDirectCommitIsAllowed(const std::string & schema_name, c
 {
     auto full_table_name = warehouse + "." + schema_name + "." + table_name;
     auto json = getJSONRequest(std::filesystem::path{TABLES_ENDPOINT} / encodeUnityFullName(full_table_name)).first;
-    if (isManagedUnityTable(json.extract<Poco::JSON::Object::Ptr>()))
-        throwUnityManagedTableWriteRefusal(full_table_name);
+    checkUnityDirectCommitIsAllowed(json.extract<Poco::JSON::Object::Ptr>(), full_table_name);
 }
 
 void UnityCatalog::createTable(

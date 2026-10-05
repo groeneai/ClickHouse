@@ -485,10 +485,13 @@ def test_create_and_insert_delta_table(started_cluster):
     assert len(commits) == 2, commits
 
 
-# Must match `MANAGED_TABLE_TYPES` in mock_servers/uc_proxy.py, which is what makes the
-# catalog report these tables as catalog-owned: `MANAGED` and `MANAGED_SHALLOW_CLONE`.
+# Must match `PATCHED_TABLE_TYPES` in mock_servers/uc_proxy.py, which is what makes the
+# catalog report these tables as not external: `MANAGED`, `MANAGED_SHALLOW_CLONE`,
+# `FOREIGN` and no `table_type` at all.
 MANAGED_TABLE = "managed_delta"
 CLONE_TABLE = "clone_delta"
+FOREIGN_TABLE = "foreign_delta"
+UNTYPED_TABLE = "untyped_delta"
 EXTERNAL_TABLE = "external_delta"
 
 # Must match `ESCAPED_NAME` in mock_servers/uc_proxy.py, which serves `managed_delta` under it.
@@ -539,7 +542,7 @@ def assert_managed_table_insert_is_rejected(node, creating_db, managed_db):
         f"INSERT INTO {managed} VALUES (1)", settings=DELTA_WRITE_SETTINGS
     )
     assert "NOT_IMPLEMENTED" in error
-    assert "managed" in error
+    assert "table_type 'MANAGED'" in error
     assert "only external tables can be written" in error
 
     # The refused write left nothing behind: only the commit that CREATE made.
@@ -603,17 +606,23 @@ def test_legacy_managed_delta_table_insert_is_rejected(started_cluster):
 
     schema_name = assert_managed_table_insert_is_rejected(node, creating_db, managed_db)
 
-    # This implementation never reads `table_type`, so a shallow clone of a managed table
-    # is resolvable here and only the write guard can refuse it.
-    clone_location = create_delta_table(node, creating_db, schema_name, CLONE_TABLE)
-    error = node.query_and_get_error(
-        f"INSERT INTO {managed_db}.`{schema_name}.{CLONE_TABLE}` VALUES (1)",
-        settings=DELTA_WRITE_SETTINGS,
-    )
-    assert "NOT_IMPLEMENTED" in error
-    assert "managed" in error
-    assert "only external tables can be written" in error
-    assert len(delta_log_commits(node, clone_location)) == 1
+    # This implementation never reads `table_type`, so a shallow clone of a managed table, a
+    # foreign table and a table without `table_type` are all resolvable here, and only the write
+    # guard can refuse them: it allows only the external table types.
+    for table_name, table_type in [
+        (CLONE_TABLE, "MANAGED_SHALLOW_CLONE"),
+        (FOREIGN_TABLE, "FOREIGN"),
+        (UNTYPED_TABLE, ""),
+    ]:
+        location = create_delta_table(node, creating_db, schema_name, table_name)
+        error = node.query_and_get_error(
+            f"INSERT INTO {managed_db}.`{schema_name}.{table_name}` VALUES (1)",
+            settings=DELTA_WRITE_SETTINGS,
+        )
+        assert "NOT_IMPLEMENTED" in error
+        assert f"table_type '{table_type}'" in error
+        assert "only external tables can be written" in error
+        assert len(delta_log_commits(node, location)) == 1
 
 
 def test_pat_token_authentication(started_cluster):

@@ -119,26 +119,22 @@ Poco::JSON::Object::Ptr buildUnityCreateTableBody(
     return body;
 }
 
-/// The `table_type` values Unity reports for a table whose data the catalog owns, so its log must
-/// not be committed directly. `EXTERNAL_SHALLOW_CLONE` is not one of them: like a plain `EXTERNAL`
-/// table, its data does not live in the catalog's own storage.
-static const std::unordered_set<std::string> MANAGED_TABLE_TYPES = {"MANAGED", "MANAGED_SHALLOW_CLONE"};
+/// The `table_type` values of tables whose data lives outside the catalog's own storage, so their
+/// log may be committed directly. Everything else (`MANAGED`, `MANAGED_SHALLOW_CLONE`, foreign tables,
+/// views, an absent or unknown value) is refused: a direct commit is safe only when it is known to be.
+static const std::unordered_set<std::string> DIRECTLY_WRITABLE_TABLE_TYPES = {"EXTERNAL", "EXTERNAL_SHALLOW_CLONE"};
 
-bool isManagedUnityTable(const Poco::JSON::Object::Ptr & table_json)
+void checkUnityDirectCommitIsAllowed(const Poco::JSON::Object::Ptr & table_json, const String & full_table_name)
 {
-    if (!table_json || !table_json->has("table_type") || table_json->isNull("table_type"))
-        return false;
+    String table_type;
+    if (table_json && table_json->has("table_type") && !table_json->isNull("table_type"))
+        table_type = table_json->getValue<String>("table_type");
 
-    const auto table_type = table_json->get("table_type");
-    return !table_type.isEmpty() && MANAGED_TABLE_TYPES.contains(table_type.extract<String>());
-}
-
-void throwUnityManagedTableWriteRefusal(const String & full_table_name)
-{
-    throw DB::Exception(
-        DB::ErrorCodes::NOT_IMPLEMENTED,
-        "INSERT into Unity Catalog managed table `{}` is not supported, only external tables can be written",
-        full_table_name);
+    if (!DIRECTLY_WRITABLE_TABLE_TYPES.contains(table_type))
+        throw DB::Exception(
+            DB::ErrorCodes::NOT_IMPLEMENTED,
+            "INSERT into Unity Catalog table `{}` with table_type '{}' is not supported, only external tables can be written",
+            full_table_name, table_type);
 }
 
 String encodeUnityFullName(const String & full_name)
