@@ -23,6 +23,7 @@ left full_sorting_merge onfly	0
 filled chain	0
 memory prewhere	0
 row policy	0
+merge table	0
 right semi	0
 left semi swapped	0
 left semi ie_join	0

@@ -224,6 +224,7 @@ public:
     QueryPlan expandForParallelReplicas();
 
     void addFilter(FilterDAGInfo filter);
+    const std::vector<FilterDAGInfo> & getPushedDownFilters() const { return pushed_down_filters; }
 
 private:
     const size_t required_max_block_size;

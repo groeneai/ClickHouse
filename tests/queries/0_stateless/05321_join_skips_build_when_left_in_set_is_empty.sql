@@ -5,6 +5,7 @@ DROP ROW POLICY IF EXISTS p_left_policy ON t_left_policy;
 DROP TABLE IF EXISTS t_left;
 DROP TABLE IF EXISTS t_left_memory;
 DROP TABLE IF EXISTS t_left_policy;
+DROP TABLE IF EXISTS t_left_merge;
 DROP TABLE IF EXISTS t_empty;
 DROP TABLE IF EXISTS t_keys;
 DROP TABLE IF EXISTS t_set_engine;
@@ -15,6 +16,7 @@ DROP TABLE IF EXISTS t_join_semi;
 CREATE TABLE t_left (k String, j String, v UInt64) ENGINE = MergeTree ORDER BY v;
 CREATE TABLE t_left_memory (k String, j String, v UInt64) ENGINE = Memory;
 CREATE TABLE t_left_policy (k String, j String, v UInt64) ENGINE = MergeTree ORDER BY v;
+CREATE TABLE t_left_merge (k String, j String, v UInt64) ENGINE = Merge(currentDatabase(), '^t_left$');
 CREATE TABLE t_empty (k String) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE t_keys (k String) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE t_set_engine (k String) ENGINE = Set;
@@ -141,6 +143,10 @@ WHERE l.k IN (SELECT k FROM t_empty) SETTINGS optimize_move_to_prewhere = 1;
 SELECT 'row policy', count() FROM t_left_policy AS l
 LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j;
 
+SELECT 'merge table', count() FROM t_left_merge AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
 SELECT 'right semi', count() FROM t_left AS l
 RIGHT SEMI JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r
 ON l.j = r.j AND l.k IN (SELECT k FROM t_empty);
@@ -260,6 +266,7 @@ DROP ROW POLICY p_left_policy ON t_left_policy;
 DROP TABLE t_left;
 DROP TABLE t_left_memory;
 DROP TABLE t_left_policy;
+DROP TABLE t_left_merge;
 DROP TABLE t_empty;
 DROP TABLE t_keys;
 DROP TABLE t_set_engine;

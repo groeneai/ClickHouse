@@ -20,6 +20,7 @@
 #include <Interpreters/TableJoin.h>
 #include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Storages/StorageMerge.h>
 #include <Storages/StorageSnapshot.h>
 #include <Common/typeid_cast.h>
 
@@ -106,6 +107,10 @@ void collectSets(const QueryPlan::Node & node, std::vector<FutureSetPtr> & sets)
         const auto prewhere = source->getPrewhereInfo();
         if (prewhere && prewhere->need_filter)
             append(getSetsRequiredByFilter(prewhere->prewhere_actions, prewhere->prewhere_column_name));
+        /// `ReadFromMerge` applies the filters pushed into it to every table it reads.
+        if (const auto * merge = typeid_cast<const ReadFromMerge *>(source))
+            for (const auto & pushed_filter : merge->getPushedDownFilters())
+                append(getSetsRequiredByFilter(pushed_filter.actions, pushed_filter.column_name));
         return;
     }
     else if (collectJoinInputSets(node, sets))
