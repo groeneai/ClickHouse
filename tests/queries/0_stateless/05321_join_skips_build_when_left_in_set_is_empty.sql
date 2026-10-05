@@ -178,6 +178,14 @@ SELECT 'group by', count() FROM (SELECT k, any(j) AS j FROM t_left GROUP BY k) A
 LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
 WHERE l.k IN (SELECT k FROM t_empty);
 
+SELECT 'merging aggregated', count() FROM (SELECT k, any(j) AS j FROM remote('127.0.0.{1,1}', currentDatabase(), t_left) GROUP BY k) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty) SETTINGS prefer_localhost_replica = 0;
+
+SELECT 'totals dropped', count() FROM (SELECT k, any(j) AS j FROM (SELECT k, any(j) AS j FROM t_left GROUP BY k WITH TOTALS) GROUP BY k) AS l
+LEFT JOIN (SELECT if(throwIf(number >= 0, 'right side was read'), '', toString(number)) AS j FROM numbers(10)) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
 -- The join still runs in full when its result does not have to be empty.
 
 SELECT 'not in', count() FROM t_left AS l
@@ -197,6 +205,11 @@ FULL JOIN (SELECT toString(number) AS j FROM numbers(5)) AS r ON l.j = r.j AND l
 SELECT 'totals';
 SELECT l.k, r.c FROM t_left AS l
 LEFT JOIN (SELECT toString(number % 3) AS j, count() AS c FROM numbers(6) GROUP BY j WITH TOTALS) AS r ON l.j = r.j
+WHERE l.k IN (SELECT k FROM t_empty);
+
+SELECT 'totals left';
+SELECT l.k, l.c, r.j FROM (SELECT k, count() AS c FROM t_left GROUP BY k WITH TOTALS) AS l
+LEFT JOIN (SELECT toString(number) AS j FROM numbers(5)) AS r ON l.k = r.j
 WHERE l.k IN (SELECT k FROM t_empty);
 
 SELECT 'right then left', count() FROM t_left AS l

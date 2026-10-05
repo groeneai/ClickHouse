@@ -9,8 +9,10 @@
 #include <Processors/QueryPlan/IEJoinStep.h>
 #include <Processors/QueryPlan/JoinStep.h>
 #include <Processors/QueryPlan/LimitByStep.h>
+#include <Processors/QueryPlan/MergingAggregatedStep.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
+#include <Processors/QueryPlan/TotalsHavingStep.h>
 #include <Processors/QueryPlan/WindowStep.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Interpreters/IJoin.h>
@@ -43,9 +45,12 @@ bool emptyInputEmptiesOutput(const IQueryPlanStep * step)
     /// Aggregation without keys or by grouping sets, e.g. `GROUPING SETS ((k), ())`, outputs a row for an empty input.
     if (const auto * aggregating = typeid_cast<const AggregatingStep *>(step))
         return !aggregating->getParams().keys.empty() && !aggregating->isGroupingSets();
+    if (const auto * merging = typeid_cast<const MergingAggregatedStep *>(step))
+        return !merging->getParams().keys.empty() && !merging->isGroupingSets();
 
+    /// `TotalsHaving` outputs its totals row on the totals port, which the short-circuit does not close.
     return typeid_cast<const ExpressionStep *>(step) || typeid_cast<const SortingStep *>(step) || typeid_cast<const DistinctStep *>(step)
-        || typeid_cast<const WindowStep *>(step) || typeid_cast<const LimitByStep *>(step)
+        || typeid_cast<const WindowStep *>(step) || typeid_cast<const LimitByStep *>(step) || typeid_cast<const TotalsHavingStep *>(step)
         || typeid_cast<const CreateSetAndFilterOnTheFlyStep *>(step) || typeid_cast<const BuildRuntimeFilterStep *>(step);
 }
 

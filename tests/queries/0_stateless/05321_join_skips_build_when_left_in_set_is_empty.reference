@@ -33,6 +33,8 @@ array join element	0
 window subquery	0	0
 limit by	0
 group by	0
+merging aggregated	0
+totals dropped	0
 not in	100
 non-empty set	20	15
 right	5
@@ -40,6 +42,9 @@ full	105
 totals
 
 	6
+totals left
+
+	0	
 right then left	5
 left, empty right	100
 filled right chain	7
