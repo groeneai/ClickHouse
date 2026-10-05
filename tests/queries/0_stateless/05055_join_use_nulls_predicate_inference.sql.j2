@@ -102,6 +102,18 @@ SELECT '-- FULL JOIN converted to INNER';
 {{ matrix(both_ids, full, 'l.lk = 80 AND r.rk = 80') }}
 SELECT '-- the left rows with no match, which a pushed down predicate would have dropped';
 {{ q(left, 'r.rk IS NULL', 1) }};
+
+-- A predicate already below one input of a join, not converted, is copied onto the other input. Both inputs
+-- are read before join_use_nulls applies, so it does not change what may be copied. Each query reads a column
+-- of the other side, which is what join_use_nulls makes nullable. Keys 10 and 149 have no match.
+{% set below_left = '(SELECT * FROM t_infer_l WHERE lk IN (10, 80)) AS l LEFT JOIN t_infer_r AS r ON l.lk = r.rk' %}
+{% set below_right = 't_infer_l AS l RIGHT JOIN (SELECT * FROM t_infer_r WHERE rk IN (80, 149)) AS r ON l.lk = r.rk' %}
+SELECT '-- LEFT JOIN, predicate on the left key below the join, join_use_nulls = 1: rk is inferred';
+{{ conditions(q(below_left, 'true', 1, 'SELECT count(), sum(r.id)')) }}
+{{ results('SELECT count(), sum(r.id)', below_left, 'true') }}
+SELECT '-- RIGHT JOIN, predicate on the right key below the join, join_use_nulls = 1: lk is inferred';
+{{ conditions(q(below_right, 'true', 1, 'SELECT count(), sum(l.id)')) }}
+{{ results('SELECT count(), sum(l.id)', below_right, 'true') }}
 DROP TABLE t_infer_l; DROP TABLE t_infer_r;
 
 -- With a single equi-key, a predicate on a matched key filters every unmatched row out before it can be
