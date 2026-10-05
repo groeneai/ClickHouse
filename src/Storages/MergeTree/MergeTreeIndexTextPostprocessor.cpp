@@ -242,7 +242,7 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     ///     tokenizer per element. For the 'array' tokenizer this keeps each element as a single token; for
     ///     any other tokenizer it splits multi-token elements (e.g. 'foo bar' -> 'foo', 'bar'). NULL elements are
     ///     skipped first, as tokenizeToArray does.
-    ///   - Non-array column: tokenize the whole value with tokens(col, '<tokenizer>').
+    ///   - Non-array column: tokenize the whole value with tokens(col, '<tokenizer>'); a NULL value yields no tokens.
     /// tokens always yields String tokens (normalizing FixedString elements to String to match the build
     /// path and the postprocessor validation) and drops empty tokens, so an empty element never reaches the
     /// postprocessor and cannot fabricate a token the index never stored.
@@ -269,6 +269,11 @@ ActionsDAG MergeTreeIndexTextPostprocessor::getOriginalActionsDAG(
     else
     {
         tokens_ast = makeASTFunction("tokens", std::move(tokens_ast), make_intrusive<ASTLiteral>(Field(tokenizer_description)));
+        if (source_ast || isNullableOrLowCardinalityNullable(col_type))
+            tokens_ast = makeASTFunction("if",
+                makeASTFunction("isNull", tokenized_value_ast->clone()),
+                makeASTFunction("emptyArrayString"),
+                std::move(tokens_ast));
     }
 
     /// arrayMap(x -> postprocessor(x), <tokens>)

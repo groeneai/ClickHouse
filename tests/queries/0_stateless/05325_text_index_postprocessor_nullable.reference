@@ -28,8 +28,9 @@ tp_ifnull	[1,3,4]
 tn_ifnull	[1,3,4]
 tp_nullif	[3]
 tn_nullif	[3]
-3. String with a NULL-producing preprocessor: the predicate is not Nullable.
+3. String and FixedString with a NULL-producing preprocessor: the predicate is not Nullable.
 tp_nullif_str	[3,4]
+tp_nullif_fs	[1,2]
 4. LowCardinality(Nullable(String)).
 tp_lc	1	\N	LowCardinality(Nullable(UInt8))
 tp_lc	2	1	LowCardinality(Nullable(UInt8))
@@ -85,3 +86,12 @@ tp_alc WHERE	[5]
 tn_alc WHERE	[]
 tp_apre NOT	[1,2]
 tn_apre NOT	[1,2,3]
+9. Nullable(FixedString) whose postprocessor rejects the nested default of NULL: a NULL value is not tokenized.
+tp_fs_num	1	\N
+tp_fs_num	2	1
+tn_fs_num	1	\N
+tn_fs_num	2	0
+tp_lcfs_num	1	\N
+tp_lcfs_num	2	1
+tn_lcfs_num	1	\N
+tn_lcfs_num	2	0

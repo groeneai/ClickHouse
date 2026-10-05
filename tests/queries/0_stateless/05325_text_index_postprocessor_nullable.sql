@@ -10,6 +10,7 @@ DROP TABLE IF EXISTS tn_ifnull;
 DROP TABLE IF EXISTS tp_nullif;
 DROP TABLE IF EXISTS tn_nullif;
 DROP TABLE IF EXISTS tp_nullif_str;
+DROP TABLE IF EXISTS tp_nullif_fs;
 DROP TABLE IF EXISTS tp_lc;
 DROP TABLE IF EXISTS tn_lc;
 DROP TABLE IF EXISTS tp_fs;
@@ -25,6 +26,10 @@ DROP TABLE IF EXISTS tp_alc;
 DROP TABLE IF EXISTS tn_alc;
 DROP TABLE IF EXISTS tp_apre;
 DROP TABLE IF EXISTS tn_apre;
+DROP TABLE IF EXISTS tp_fs_num;
+DROP TABLE IF EXISTS tn_fs_num;
+DROP TABLE IF EXISTS tp_lcfs_num;
+DROP TABLE IF EXISTS tn_lcfs_num;
 
 SELECT '1. Nullable(String), no preprocessor.';
 
@@ -86,12 +91,17 @@ SELECT 'tn_ifnull', arraySort(groupArray(id)) FROM tn_ifnull WHERE NOT hasAnyTok
 SELECT 'tp_nullif', arraySort(groupArray(id)) FROM tp_nullif WHERE NOT hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 SELECT 'tn_nullif', arraySort(groupArray(id)) FROM tn_nullif WHERE NOT hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 
-SELECT '3. String with a NULL-producing preprocessor: the predicate is not Nullable.';
+SELECT '3. String and FixedString with a NULL-producing preprocessor: the predicate is not Nullable.';
 
 CREATE TABLE tp_nullif_str (id UInt32, s String, INDEX tix s TYPE text(tokenizer = splitByNonAlpha, preprocessor = nullIf(s, ''), postprocessor = lower(s)))
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
 INSERT INTO tp_nullif_str VALUES (2, 'hello world'), (3, 'foo'), (4, '');
 SELECT 'tp_nullif_str', arraySort(groupArray(id)) FROM tp_nullif_str WHERE NOT hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
+CREATE TABLE tp_nullif_fs (id UInt32, s FixedString(6), INDEX tix s TYPE text(tokenizer = ngrams(3), preprocessor = nullIf(s, '123456'), postprocessor = if(match(s, '[a-z]'), s, '#')))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+INSERT INTO tp_nullif_fs VALUES (1, '123456'), (2, 'hello'), (3, '678900');
+-- Row 1 becomes NULL, which has no tokens. Row 3 matches through the postprocessor: '999' and its tokens all map to '#'.
+SELECT 'tp_nullif_fs', arraySort(groupArray(id)) FROM tp_nullif_fs WHERE NOT hasAnyTokens(s, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 
 SELECT '4. LowCardinality(Nullable(String)).';
 
@@ -189,6 +199,26 @@ INSERT INTO tn_apre VALUES (1, ['12345']), (2, ['hello']), (3, ['67890']);
 SELECT 'tp_apre NOT', arraySort(groupArray(id)) FROM tp_apre WHERE NOT hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 SELECT 'tn_apre NOT', arraySort(groupArray(id)) FROM tn_apre WHERE NOT hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 
+SELECT '9. Nullable(FixedString) whose postprocessor rejects the nested default of NULL: a NULL value is not tokenized.';
+
+CREATE TABLE tp_fs_num (id UInt32, s Nullable(FixedString(6)), INDEX tix s TYPE text(tokenizer = ngrams(6), postprocessor = toString(toUInt64(s) % 10)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tn_fs_num (id UInt32, s Nullable(FixedString(6)), INDEX tix s TYPE text(tokenizer = ngrams(6)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tp_lcfs_num (id UInt32, s LowCardinality(Nullable(FixedString(6))), INDEX tix s TYPE text(tokenizer = ngrams(6), postprocessor = toString(toUInt64(s) % 10)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tn_lcfs_num (id UInt32, s LowCardinality(Nullable(FixedString(6))), INDEX tix s TYPE text(tokenizer = ngrams(6)))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+INSERT INTO tp_fs_num VALUES (1, NULL), (2, '123456');
+INSERT INTO tn_fs_num VALUES (1, NULL), (2, '123456');
+INSERT INTO tp_lcfs_num VALUES (1, NULL), (2, '123456');
+INSERT INTO tn_lcfs_num VALUES (1, NULL), (2, '123456');
+-- '999996' and '123456' both map to '6'. Without short-circuit evaluation, tokens of a NULL reaching the postprocessor throw.
+SELECT 'tp_fs_num', id, hasAnyTokens(s, '999996') FROM tp_fs_num ORDER BY id SETTINGS use_skip_indexes = 0, query_plan_direct_read_from_text_index = 0, short_circuit_function_evaluation = 'disable';
+SELECT 'tn_fs_num', id, hasAnyTokens(s, '999996') FROM tn_fs_num ORDER BY id SETTINGS use_skip_indexes = 0, query_plan_direct_read_from_text_index = 0, short_circuit_function_evaluation = 'disable';
+SELECT 'tp_lcfs_num', id, hasAnyTokens(s, '999996') FROM tp_lcfs_num ORDER BY id SETTINGS use_skip_indexes = 0, query_plan_direct_read_from_text_index = 0, short_circuit_function_evaluation = 'disable';
+SELECT 'tn_lcfs_num', id, hasAnyTokens(s, '999996') FROM tn_lcfs_num ORDER BY id SETTINGS use_skip_indexes = 0, query_plan_direct_read_from_text_index = 0, short_circuit_function_evaluation = 'disable';
+
 DROP TABLE tp;
 DROP TABLE tn;
 DROP TABLE tp_lower;
@@ -198,6 +228,7 @@ DROP TABLE tn_ifnull;
 DROP TABLE tp_nullif;
 DROP TABLE tn_nullif;
 DROP TABLE tp_nullif_str;
+DROP TABLE tp_nullif_fs;
 DROP TABLE tp_lc;
 DROP TABLE tn_lc;
 DROP TABLE tp_fs;
@@ -213,3 +244,7 @@ DROP TABLE tp_alc;
 DROP TABLE tn_alc;
 DROP TABLE tp_apre;
 DROP TABLE tn_apre;
+DROP TABLE tp_fs_num;
+DROP TABLE tn_fs_num;
+DROP TABLE tp_lcfs_num;
+DROP TABLE tn_lcfs_num;
