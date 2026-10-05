@@ -102,7 +102,6 @@ namespace
     constexpr bool watcher_reports_replaced_targets = false;
 #endif
 
-    /// 0 if the entry cannot be read.
     UInt64 getEntryInode(const String & path)
     {
         struct stat entry_stat{};
@@ -608,14 +607,12 @@ bool StorageFileLog::rekeyIfNoEvent(const String & file_name, FileContext & file
     const String file_path = getFullDataPath(file_name);
     struct stat file_stat{};
     struct stat entry_stat{};
-    /// Without a watcher, or with inotify for a symlink whose own entry did not change (its target was replaced), no
-    /// event re-keys a name that leads to another file.
+    /// inotify does not report a replaced symlink target.
     if (stat(file_path.c_str(), &file_stat) == 0 && file_stat.st_ino != file_ctx.inode
         && (!directory_watch
             || (!watcher_reports_replaced_targets && lstat(file_path.c_str(), &entry_stat) == 0 && S_ISLNK(entry_stat.st_mode)
                 && entry_stat.st_ino == file_ctx.entry_inode)))
     {
-        /// A file the table reads under another name is not read again.
         if (file_infos.meta_by_inode.contains(file_stat.st_ino))
             return false;
         file_infos.meta_by_inode.erase(file_ctx.inode);
@@ -634,7 +631,6 @@ void StorageFileLog::openFilesAndSetPos()
         auto & file_ctx = findInMap(file_infos.context_by_name, file);
         if (file_ctx.status != FileStatus::NO_CHANGE || file_ctx.open_failed)
         {
-            /// Not read this poll; a file whose open failed before is retried.
             auto skip_file = [&]
             {
                 file_ctx.reader.reset();
@@ -689,11 +685,9 @@ void StorageFileLog::openFilesAndSetPos()
             }
             auto & reader = file_ctx.reader.value();
             assertStreamGood(reader);
-            /// Read only if the path leads to the file the offset is kept for; a replaced entry is re-keyed by its
-            /// directory events.
+            /// Read only the file the offset is kept for; a replaced entry is re-keyed by its directory events.
             if (stat(file_path.c_str(), &file_stat) != 0 || file_stat.st_ino != file_ctx.inode)
             {
-                /// Without directory events, the next poll looks again.
                 if (!isTrackedByDirectoryEvents(file))
                     file_ctx.open_failed = true;
                 skip_file();
@@ -1520,7 +1514,6 @@ void StorageFileLog::resetReadPosition(const std::optional<String> & file_name, 
 
         auto add_target = [&](const String & name, FileContext & file_ctx, UInt64 new_offset)
         {
-            /// The offset is for the file the name leads to now; a file read under another name is not read under this one.
             if (!rekeyIfNoEvent(name, file_ctx))
                 return;
             FileMeta new_meta = findInMap(file_infos.meta_by_inode, file_ctx.inode);
