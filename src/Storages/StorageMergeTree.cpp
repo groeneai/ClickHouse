@@ -2290,9 +2290,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
         /// it is correct only while something still runs that removal, hence the cleanup check.
         /// `clearEmptyParts`'s `outdated_data_parts_loading_finished` gate is deliberately not mirrored: that window is the race.
         if (part->rows_count == 0 && (*storage_settings.get())[MergeTreeSetting::remove_empty_parts]
-            && !cleanup_thread.isCleanupCancelled()
-            && (part->version->getInfo().creation_tid.isNonTransactional()
-                || part->version->isVisible(TransactionManager::instance().getLatestSnapshot())))
+            && !cleanup_thread.isCleanupCancelled() && part->version->isVisibleByLatestSnapshot())
         {
             current_parts_postpone_reasons[part->name] = PostponeReasons::EMPTY_PART_WILL_BE_DROPPED;
             cleanup_thread.requestEmptyPartsCleanup();
