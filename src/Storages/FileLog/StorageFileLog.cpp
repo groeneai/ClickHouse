@@ -708,7 +708,6 @@ void StorageFileLog::openFilesAndSetPos()
             const bool same_inode = identity.inode == file_ctx.inode;
             if (meta.inode_generation && (!identity.inode || (same_inode && !identity.generation)))
             {
-                /// Not read until it is known whether this is still the file its offset was saved for.
                 if (!std::exchange(file_ctx.identity_unverified, true))
                     LOG_WARNING(log, "Cannot check whether file {} is the file its offset was saved for, will retry", file);
                 file_ctx.reader.reset();
@@ -723,10 +722,9 @@ void StorageFileLog::openFilesAndSetPos()
             {
                 if (meta.inode_generation && *meta.inode_generation != *identity.generation)
                 {
-                    /// The file the offset was saved for was deleted, and this file got its inode number.
                     if (!fileNameMatches(file))
                     {
-                        /// A name the glob excludes was kept only to finish that file; dropped by the next `updateFileInfos`.
+                        /// A name the glob excludes was kept only to finish the deleted file; dropped by the next `updateFileInfos`.
                         file_ctx.reader.reset();
                         file_ctx.status = FileStatus::REMOVED;
                         continue;
