@@ -132,7 +132,7 @@ INSERT INTO tp_partial VALUES (1, NULL), (2, 'Hello world'), (3, 'foo');
 ALTER TABLE tp_partial ADD INDEX tix s TYPE text(tokenizer = splitByNonAlpha, postprocessor = lower(s));
 INSERT INTO tp_partial SETTINGS materialize_skip_indexes_on_insert = 1 VALUES (11, NULL), (12, 'Hello'), (13, 'bar');
 SELECT 'tp_partial', arraySort(groupArray(id)) FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1;
-SELECT 'tp_partial direct read', countIf(position(explain, '__text_index_') > 0) > 0
+SELECT 'tp_partial direct read', countIf(position(explain, '__text_index_tix_hasAnyTokens_') > 0) > 0
 FROM (EXPLAIN actions = 1 SELECT id FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1);
 
 DROP TABLE tp;
