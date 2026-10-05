@@ -21,6 +21,8 @@ DROP TABLE IF EXISTS tp_afs;
 DROP TABLE IF EXISTS tn_afs;
 DROP TABLE IF EXISTS tp_mfs;
 DROP TABLE IF EXISTS tn_mfs;
+DROP TABLE IF EXISTS tp_apre;
+DROP TABLE IF EXISTS tn_apre;
 
 SELECT '1. Nullable(String), no preprocessor.';
 
@@ -108,12 +110,13 @@ CREATE TABLE tp_fs (id UInt32, s Nullable(FixedString(6)), INDEX tix s TYPE text
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
 CREATE TABLE tn_fs (id UInt32, s Nullable(FixedString(6)), INDEX tix s TYPE text(tokenizer = ngrams(3)))
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
-INSERT INTO tp_fs VALUES (1, NULL), (2, 'hello');
-INSERT INTO tn_fs VALUES (1, NULL), (2, 'hello');
-SELECT 'tp_fs', id, hasAnyTokens(s, '123') FROM tp_fs ORDER BY id;
-SELECT 'tn_fs', id, hasAnyTokens(s, '123') FROM tn_fs ORDER BY id;
-SELECT 'tp_fs WHERE', arraySort(groupArray(id)) FROM tp_fs WHERE hasAnyTokens(s, '123') SETTINGS use_skip_indexes = 0;
-SELECT 'tn_fs WHERE', arraySort(groupArray(id)) FROM tn_fs WHERE hasAnyTokens(s, '123') SETTINGS use_skip_indexes = 0;
+INSERT INTO tp_fs VALUES (1, NULL), (2, 'hello'), (3, '12345');
+INSERT INTO tn_fs VALUES (1, NULL), (2, 'hello'), (3, '12345');
+-- '999' has no letter, so the postprocessor maps it, like every letter-free token, to '#': '12345' matches only through the rewrite.
+SELECT 'tp_fs', id, hasAnyTokens(s, '999') FROM tp_fs ORDER BY id;
+SELECT 'tn_fs', id, hasAnyTokens(s, '999') FROM tn_fs ORDER BY id;
+SELECT 'tp_fs WHERE', arraySort(groupArray(id)) FROM tp_fs WHERE hasAnyTokens(s, '999') SETTINGS use_skip_indexes = 0;
+SELECT 'tn_fs WHERE', arraySort(groupArray(id)) FROM tn_fs WHERE hasAnyTokens(s, '999') SETTINGS use_skip_indexes = 0;
 
 SELECT '6. Map(String, Nullable(String)) element, index on mapValues.';
 
@@ -139,7 +142,7 @@ SELECT 'tp_partial', arraySort(groupArray(id)) FROM tp_partial WHERE hasAnyToken
 SELECT 'tp_partial direct read', countIf(position(explain, '__text_index_tix_hasAnyTokens_') > 0) > 0
 FROM (EXPLAIN actions = 1 SELECT id FROM tp_partial WHERE hasAnyTokens(s, 'hello') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1);
 
-SELECT '8. Array(Nullable(FixedString)) and Map values: a NULL element must not produce tokens.';
+SELECT '8. Array(Nullable(FixedString)) and LowCardinality Map values: a NULL element must not produce tokens.';
 
 CREATE TABLE tp_afs (id UInt32, a Array(Nullable(FixedString(6))), INDEX tix a TYPE text(tokenizer = ngrams(3), postprocessor = if(match(a, '[a-z]'), a, '#')))
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
@@ -147,20 +150,33 @@ CREATE TABLE tn_afs (id UInt32, a Array(Nullable(FixedString(6))), INDEX tix a T
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
 INSERT INTO tp_afs VALUES (1, [NULL]), (2, ['hello']), (3, [NULL, 'hello']), (4, []), (5, ['12345']);
 INSERT INTO tn_afs VALUES (1, [NULL]), (2, ['hello']), (3, [NULL, 'hello']), (4, []), (5, ['12345']);
-SELECT 'tp_afs', id, hasAnyTokens(a, '123'), hasAllTokens(a, '123') FROM tp_afs ORDER BY id SETTINGS use_skip_indexes = 0;
-SELECT 'tn_afs', id, hasAnyTokens(a, '123'), hasAllTokens(a, '123') FROM tn_afs ORDER BY id SETTINGS use_skip_indexes = 0;
-SELECT 'tp_afs WHERE', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 0;
-SELECT 'tn_afs WHERE', arraySort(groupArray(id)) FROM tn_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 0;
-SELECT 'tp_afs index', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '123') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1;
+SELECT 'tp_afs', id, hasAnyTokens(a, '999'), hasAllTokens(a, '999') FROM tp_afs ORDER BY id SETTINGS use_skip_indexes = 0;
+SELECT 'tn_afs', id, hasAnyTokens(a, '999'), hasAllTokens(a, '999') FROM tn_afs ORDER BY id SETTINGS use_skip_indexes = 0;
+SELECT 'tp_afs WHERE', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 0;
+SELECT 'tn_afs WHERE', arraySort(groupArray(id)) FROM tn_afs WHERE hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 0;
+SELECT 'tp_afs index', arraySort(groupArray(id)) FROM tp_afs WHERE hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1;
+SELECT 'tp_afs direct read', countIf(position(explain, '__text_index_tix_hasAnyTokens_') > 0) > 0
+FROM (EXPLAIN actions = 1 SELECT id FROM tp_afs WHERE hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 1);
 
-CREATE TABLE tp_mfs (id UInt32, m Map(String, Nullable(FixedString(6))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3), postprocessor = if(match(mapValues(m), '[a-z]'), mapValues(m), '#')))
+SET allow_suspicious_low_cardinality_types = 1;
+CREATE TABLE tp_mfs (id UInt32, m Map(String, LowCardinality(Nullable(FixedString(6)))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3), postprocessor = if(match(mapValues(m), '[a-z]'), mapValues(m), '#')))
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
-CREATE TABLE tn_mfs (id UInt32, m Map(String, Nullable(FixedString(6))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3)))
+CREATE TABLE tn_mfs (id UInt32, m Map(String, LowCardinality(Nullable(FixedString(6)))), INDEX tix mapValues(m) TYPE text(tokenizer = ngrams(3)))
 ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
 INSERT INTO tp_mfs VALUES (1, map()), (2, map('k', 'hello')), (3, map('k', NULL)), (4, map('j', NULL, 'k', 'hello')), (5, map('k', '12345'));
 INSERT INTO tn_mfs VALUES (1, map()), (2, map('k', 'hello')), (3, map('k', NULL)), (4, map('j', NULL, 'k', 'hello')), (5, map('k', '12345'));
-SELECT 'tp_mfs WHERE', arraySort(groupArray(id)) FROM tp_mfs WHERE hasAnyTokens(mapValues(m), '123') SETTINGS use_skip_indexes = 0;
-SELECT 'tn_mfs WHERE', arraySort(groupArray(id)) FROM tn_mfs WHERE hasAnyTokens(mapValues(m), '123') SETTINGS use_skip_indexes = 0;
+SELECT 'tp_mfs WHERE', arraySort(groupArray(id)) FROM tp_mfs WHERE hasAnyTokens(mapValues(m), '999') SETTINGS use_skip_indexes = 0;
+SELECT 'tn_mfs WHERE', arraySort(groupArray(id)) FROM tn_mfs WHERE hasAnyTokens(mapValues(m), '999') SETTINGS use_skip_indexes = 0;
+
+CREATE TABLE tp_apre (id UInt32, a Array(FixedString(6)), INDEX tix a TYPE text(tokenizer = ngrams(3), preprocessor = nullIf(a, '12345'), postprocessor = if(match(a, '[a-z]'), a, '#')))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+CREATE TABLE tn_apre (id UInt32, a Array(FixedString(6)), INDEX tix a TYPE text(tokenizer = ngrams(3), preprocessor = nullIf(a, '12345')))
+ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1;
+INSERT INTO tp_apre VALUES (1, ['12345']), (2, ['hello']), (3, ['67890']);
+INSERT INTO tn_apre VALUES (1, ['12345']), (2, ['hello']), (3, ['67890']);
+-- The preprocessor makes the element of row 1 NULL, which the index build skips.
+SELECT 'tp_apre NOT', arraySort(groupArray(id)) FROM tp_apre WHERE NOT hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
+SELECT 'tn_apre NOT', arraySort(groupArray(id)) FROM tn_apre WHERE NOT hasAnyTokens(a, '999') SETTINGS use_skip_indexes = 1, query_plan_direct_read_from_text_index = 0;
 
 DROP TABLE tp;
 DROP TABLE tn;
@@ -182,3 +198,5 @@ DROP TABLE tp_afs;
 DROP TABLE tn_afs;
 DROP TABLE tp_mfs;
 DROP TABLE tn_mfs;
+DROP TABLE tp_apre;
+DROP TABLE tn_apre;

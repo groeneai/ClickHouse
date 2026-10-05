@@ -44,9 +44,11 @@ tn_lc NOT	[3,4]
 5. Nullable(FixedString): the nested default of a NULL must not produce tokens.
 tp_fs	1	\N
 tp_fs	2	0
+tp_fs	3	1
 tn_fs	1	\N
 tn_fs	2	0
-tp_fs WHERE	[]
+tn_fs	3	0
+tp_fs WHERE	[3]
 tn_fs WHERE	[]
 6. Map(String, Nullable(String)) element, index on mapValues.
 tp_map	1	\N
@@ -62,7 +64,7 @@ tn_map NOT	[2]
 7. Direct read with a part where the index is not materialized.
 tp_partial	[2,12]
 tp_partial direct read	1
-8. Array(Nullable(FixedString)) and Map values: a NULL element must not produce tokens.
+8. Array(Nullable(FixedString)) and LowCardinality Map values: a NULL element must not produce tokens.
 tp_afs	1	0	0
 tp_afs	2	0	0
 tp_afs	3	0	0
@@ -72,9 +74,12 @@ tn_afs	1	0	0
 tn_afs	2	0	0
 tn_afs	3	0	0
 tn_afs	4	0	0
-tn_afs	5	1	1
+tn_afs	5	0	0
 tp_afs WHERE	[5]
-tn_afs WHERE	[5]
+tn_afs WHERE	[]
 tp_afs index	[5]
+tp_afs direct read	1
 tp_mfs WHERE	[5]
-tn_mfs WHERE	[5]
+tn_mfs WHERE	[]
+tp_apre NOT	[1,2]
+tn_apre NOT	[1,2,3]
