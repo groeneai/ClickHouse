@@ -17,7 +17,6 @@ using FutureSetPtr = std::shared_ptr<FutureSet>;
 
 /// The sets of the `in` conjuncts of a filter that cannot change while the query runs: no row passes it when one of them is empty.
 std::vector<FutureSetPtr> getSetsRequiredByFilter(const ActionsDAG & dag, const String & filter_column_name);
-/// True if one of the sets is built and has no rows.
 bool hasBuiltEmptySet(const std::vector<FutureSetPtr> & sets);
 
 /** Implements WHERE, HAVING operations.
