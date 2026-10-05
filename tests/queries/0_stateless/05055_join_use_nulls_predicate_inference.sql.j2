@@ -206,3 +206,10 @@ SELECT l.number, r.a FROM (SELECT number FROM numbers(10)) AS l LEFT JOIN (SELEC
 ON toUInt64(rowNumberInAllBlocks() + l.number * 0) = r.a WHERE r.a >= 5 AND r.a <= 6 ORDER BY l.number
 SETTINGS join_use_nulls = 1, max_threads = 1, query_plan_filter_push_down = {{ pushdown }};
 {% endfor -%}
+-- A constant key and a materialized one are equal to the join but not to a predicate reading the
+-- representation, so such a predicate must not be copied onto the opposite key.
+SELECT '-- constant key read by isConstant: the matched row survives';
+SELECT l.k, r.p, l.x
+FROM (SELECT 5 :: Nullable(UInt64) AS k, 1 AS x) AS l FULL JOIN (SELECT materialize(5 :: Nullable(UInt64)) AS k, 7 AS p) AS r
+ON l.k = r.k WHERE r.k = 5 AND isConstant(r.k) = 0
+SETTINGS join_use_nulls = 1;
