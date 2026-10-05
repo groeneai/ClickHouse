@@ -95,6 +95,10 @@ private:
 
     AccessRightsElements getRequiredAccess(RenameType type) const;
 
+    /// The dictionary privileges for the objects the query moves, by their kind on this host. An unqualified name is
+    /// resolved in `default_database`; an object this host does not have counts as a dictionary if `assume_dictionary_if_missing`.
+    AccessRightsElements getRequiredAccessForDictionaries(const String & default_database, bool assume_dictionary_if_missing) const;
+
     ASTPtr query_ptr;
     bool renamed_instead_of_exchange{false};
     bool skip_access_check{false};
