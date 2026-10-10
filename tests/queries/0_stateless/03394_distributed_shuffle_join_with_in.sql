@@ -56,7 +56,6 @@ FROM
    (SELECT path, sum(hits) as hits FROM test WHERE lang IN ('en', 'de') GROUP BY path) AS en,
    (SELECT path, sum(hits) as hits FROM test WHERE lang = 'de' GROUP BY path) AS de
 WHERE (en.path = de.path)
-ORDER BY ALL
-SETTINGS distributed_plan_fallback_to_local_execution = 0;
+ORDER BY ALL;
 
 DROP TABLE test;

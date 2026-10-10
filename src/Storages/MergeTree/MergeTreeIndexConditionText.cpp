@@ -327,13 +327,10 @@ TextIndexDirectReadMode MergeTreeIndexConditionText::getDirectReadMode(const Str
 {
     const bool is_array_tokenizer = (tokenizer->getType() == ITokenizer::Type::Array);
 
-    /// One token per pair: `m['key'] = 'value'` is one posting list, `mapContainsKeyValue` the union of
-    /// the first-occurrence and repeated-occurrence lists. Nothing else is supported yet.
+    /// One token per pair, so `m['key'] = 'value'` is a single-token lookup whose posting list is exactly
+    /// the matching rows. Nothing else is supported yet.
     if (tokenizer->getType() == ITokenizer::Type::KeyValuePairs)
-    {
-        const bool is_exact = function_name == "equals" || function_name == "mapContainsKeyValue";
-        return is_exact ? TextIndexDirectReadMode::Exact : TextIndexDirectReadMode::None;
-    }
+        return function_name == "equals" ? TextIndexDirectReadMode::Exact : TextIndexDirectReadMode::None;
 
     if (function_name == "hasToken"
         || function_name == "hasAnyTokens"
@@ -400,9 +397,8 @@ bool MergeTreeIndexConditionText::canAnswerFunctionNode(const ActionsDAG::Node &
         return true;
 
     const auto function_name = node.function_base->getName();
-    /// The third argument is an ESCAPE character for `like`/`ilike` and the searched value for
-    /// `mapContainsKeyValue`, not a tokenizer.
-    if (function_name == "like" || function_name == "ilike" || function_name == "mapContainsKeyValue")
+    /// The third argument of `like` and `ilike` is an ESCAPE character, not a tokenizer.
+    if (function_name == "like" || function_name == "ilike")
         return true;
 
     RPNBuilderTreeContext rpn_tree_context(getContext());
@@ -670,7 +666,8 @@ std::string MergeTreeIndexConditionText::getDescription() const
         {
             if (i > 0)
                 description += ", ";
-            description += tokenizer->formatTokenForLogs(all_search_tokens[i]);
+
+            description += fmt::format("\"{}\"", all_search_tokens[i]);
         }
     }
 
@@ -763,10 +760,6 @@ bool MergeTreeIndexConditionText::traverseAtomNode(const RPNBuilderTreeNode & no
 
         if (function_arguments_size == 3)
         {
-            /// Both needles are arguments of the call, so the (column, constant) shape below cannot express it.
-            if (function_name == "mapContainsKeyValue")
-                return traverseMapContainsKeyValueNode(function, out);
-
             /// The index path tokenizes needles with the index tokenizer, so it can answer the
             /// predicate only when the tokenizer argument denotes that same tokenizer.
             if (!tokenizerArgumentMatchesIndex(function_name, function.getArgumentAt(2)))
@@ -1168,83 +1161,6 @@ static bool tryNormalizeNeedlePadding(Field & value, const DataTypePtr & value_t
         return true;
 
     return tryNormalizeNeedlePadding(value.safeGet<String>(), isFixedString(inner_type), context);
-}
-
-namespace
-{
-
-/// Whether converting a value of type `from` to type `to` never changes it and never throws.
-/// `LowCardinality` may be added or dropped and `Nullable` may be added, at any depth of `Array`.
-/// `Nullable` cannot be dropped, because it may throw on NULL.
-bool isLosslessConversion(const DataTypePtr & from, const DataTypePtr & to)
-{
-    auto from_type = removeLowCardinality(from);
-    auto to_type = removeLowCardinality(to);
-
-    if (to_type->isNullable())
-    {
-        from_type = removeNullable(from_type);
-        to_type = removeNullable(to_type);
-    }
-    else if (from_type->isNullable())
-    {
-        return false;
-    }
-
-    if (from_type->equals(*to_type))
-        return true;
-
-    const auto * from_array = typeid_cast<const DataTypeArray *>(from_type.get());
-    const auto * to_array = typeid_cast<const DataTypeArray *>(to_type.get());
-    return from_array && to_array && isLosslessConversion(from_array->getNestedType(), to_array->getNestedType());
-}
-
-/// Whether the node is `CAST`, `_CAST`, `toNullable` or `toLowCardinality` with a lossless conversion (see above).
-bool isLosslessConversionFunction(const ActionsDAG::Node & node)
-{
-    if (node.type != ActionsDAG::ActionType::FUNCTION || !node.function_base)
-        return false;
-
-    const auto function_name = node.function_base->getName();
-    const size_t arguments_size = node.children.size();
-
-    const bool is_cast = (function_name == "CAST" || function_name == "_CAST") && arguments_size == 2;
-    const bool is_wrapper = (function_name == "toNullable" || function_name == "toLowCardinality") && arguments_size == 1;
-
-    if (!is_cast && !is_wrapper)
-        return false;
-
-    return isLosslessConversion(node.children.front()->result_type, node.result_type);
-}
-
-/// Strips lossless conversions from the node (see above).
-RPNBuilderTreeNode unwrapLosslessConversion(const RPNBuilderTreeNode & node)
-{
-    if (!node.isFunction())
-        return node;
-
-    /// Only the DAG form carries the types; the AST form is left as is.
-    const auto function = node.toFunctionNode();
-    const auto * function_dag_node = function.getDAGNode();
-
-    if (!function_dag_node || !isLosslessConversionFunction(*function_dag_node))
-        return node;
-
-    return unwrapLosslessConversion(function.getArgumentAt(0));
-}
-
-}
-
-const ActionsDAG::Node * unwrapLosslessConversion(const ActionsDAG::Node * node)
-{
-    const auto * node_without_alias = node;
-    while (node_without_alias->type == ActionsDAG::ActionType::ALIAS)
-        node_without_alias = node_without_alias->children.front();
-
-    if (!isLosslessConversionFunction(*node_without_alias))
-        return node;
-
-    return unwrapLosslessConversion(node_without_alias->children.front());
 }
 
 /// The value an absent map key reads: `''`, or all NUL when the value type is `FixedString`.
@@ -1917,6 +1833,28 @@ static bool prepareSetsForDefaultValueEvaluation(const ActionsDAG & subdag, cons
     return true;
 }
 
+/// Whether the predicate of the sub-DAG may be true on the default value of its single input column,
+/// i.e. for a row with a missing map key or JSON path. Unknown if the predicate throws on the default value,
+/// e.g. `toUInt64(m['key'])` on an empty string, as in `filterResultForNotMatchedRows` for JOIN.
+static bool mayBeTrueOnDefaultValue(const ActionsDAG & subdag)
+{
+    const auto * input = subdag.getInputs().front();
+    ActionsDAG::IntermediateExecutionResult default_input;
+    default_input.emplace(input, ColumnWithTypeAndName(input->result_type->createColumnConstWithDefaultValue(1), input->result_type, input->result_name));
+
+    ColumnsWithTypeAndName result;
+    try
+    {
+        result = ActionsDAG::evaluatePartialResult(default_input, subdag.getOutputs(), /*input_rows_count=*/ 1);
+    }
+    catch (const Exception &)
+    {
+        return true;
+    }
+
+    return !result.front().column || result.front().column->getBool(0);
+}
+
 bool MergeTreeIndexConditionText::traverseMapElementKeyNode(const RPNBuilderFunctionTreeNode & function_node, RPNElement & out) const
 {
     /// Here we check whether we can use index defined for `mapKeys(m)` for functions like `func(arrayElement(m, 'const_key'), ...)`.
@@ -1941,7 +1879,6 @@ bool MergeTreeIndexConditionText::traverseMapElementKeyNode(const RPNBuilderFunc
         return false;
 
     auto required_column = required_columns.front();
-    auto output_column_name = outputs.front()->result_name;
 
     std::optional<String> key_const_value;
 
@@ -2007,13 +1944,8 @@ bool MergeTreeIndexConditionText::traverseMapElementKeyNode(const RPNBuilderFunc
         return false;
 
     /// Evaluate function on the empty map. Empty map will return default value for any key.
-    Block block{{required_column.type->createColumnConstWithDefaultValue(1), required_column.type, required_column.name}};
-    ExpressionActions actions(std::move(subdag));
-    actions.execute(block);
-    const auto & result_column = block.getByName(output_column_name).column;
-
     /// If the function returns true for the empty map, we cannot use index.
-    if (result_column->getBool(0))
+    if (mayBeTrueOnDefaultValue(subdag))
         return false;
 
     auto tokens = stringToTokens(std::string_view(*key_const_value));
@@ -2083,54 +2015,13 @@ bool MergeTreeIndexConditionText::traverseMapElementKeyValueNode(
     if (value.empty())
         return false;
 
-    /// `m['key']` is the key's first occurrence: is_duplicate = 0.
+    /// `m['key']` is the key's first occurrence: is_rest = 0.
     VectorWithMemoryTracking<String> tokens;
-    tokens.push_back(KeyValuePairsTokenizer::encodeToken(*key, value, /*is_duplicate=*/ false));
+    tokens.push_back(KeyValuePairsTokenizer::encodeToken(*key, value, /*is_rest=*/ false));
 
     out.function = RPNElement::FUNCTION_EQUALS;
     out.text_search_queries.emplace_back(
         std::make_shared<TextSearchQuery>(function_name, TextSearchMode::All, direct_read_mode, std::move(tokens)));
-    return true;
-}
-
-bool MergeTreeIndexConditionText::traverseMapContainsKeyValueNode(
-    const RPNBuilderFunctionTreeNode & function_node, RPNElement & out) const
-{
-    if (tokenizer->getType() != ITokenizer::Type::KeyValuePairs)
-        return false;
-
-    if (!hasIndexForColumn(function_node.getArgumentAt(0).getColumnName()))
-        return false;
-
-    /// FixedString excluded: its padding is compared away by the function but not stored in the token,
-    /// so exact direct read would drop matching rows. Same as traverseMapElementKeyValueNode.
-    auto get_string_constant = [](const RPNBuilderTreeNode & node) -> std::optional<String>
-    {
-        Field field;
-        DataTypePtr type;
-        if (!node.tryGetConstant(field, type) || !WhichDataType(type).isString())
-            return std::nullopt;
-        return field.safeGet<String>();
-    };
-
-    auto key = get_string_constant(function_node.getArgumentAt(1));
-    if (!key)
-        return false;
-
-    auto value = get_string_constant(function_node.getArgumentAt(2));
-    if (!value)
-        return false;
-
-    /// The pair is either the key's first occurrence or a repetition. Every entry has a token, so even
-    /// an empty value is searchable here, unlike in `equals`.
-    VectorWithMemoryTracking<String> tokens;
-    tokens.push_back(KeyValuePairsTokenizer::encodeToken(*key, *value, /*is_duplicate=*/ false));
-    tokens.push_back(KeyValuePairsTokenizer::encodeToken(*key, *value, /*is_duplicate=*/ true));
-
-    const auto function_name = function_node.getFunctionName();
-    out.function = RPNElement::FUNCTION_HAS_ANY_TOKENS;
-    out.text_search_queries.emplace_back(std::make_shared<TextSearchQuery>(
-        function_name, TextSearchMode::Any, getDirectReadMode(function_name), std::move(tokens)));
     return true;
 }
 
@@ -2189,8 +2080,7 @@ bool MergeTreeIndexConditionText::traverseJSONSubcolumnKeyNode(
     if (required_columns.size() != 1 || outputs.size() != 1)
         return false;
 
-    auto required_column = required_columns.front();
-    auto output_column_name = outputs.front()->result_name;
+    const auto & required_column = required_columns.front();
 
     /// Try to match the required column to a JSON subcolumn with JSONAllPaths index.
     auto json_info = tryMatchJSONSubcolumnToIndex(required_column.name, header, "JSONAllPaths");
@@ -2203,13 +2093,7 @@ bool MergeTreeIndexConditionText::traverseJSONSubcolumnKeyNode(
     /// Evaluate the function on a default column value.
     /// If the function returns true for the default value (what we'd get when the path is missing),
     /// we cannot safely skip the granule.
-    Block block{{required_column.type->createColumnConstWithDefaultValue(1),
-                 required_column.type, required_column.name}};
-    ExpressionActions actions(std::move(subdag));
-    actions.execute(block);
-    const auto & result_column = block.getByName(output_column_name).column;
-
-    if (result_column->getBool(0))
+    if (mayBeTrueOnDefaultValue(subdag))
         return false;
 
     auto tokens = stringToTokens(Field(json_info->path));
