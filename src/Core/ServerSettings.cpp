@@ -2,6 +2,7 @@
 #include <Access/AccessControl.h>
 #include <Columns/IColumn.h>
 #include <Common/Jemalloc.h>
+#include <Common/AsynchronousMetricsKeyValuesMode.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Core/BaseSettings.h>
@@ -30,10 +31,10 @@
 #    include <Processors/Formats/Impl/ParquetMetadataCache.h>
 #endif
 #include <Storages/System/ServerSettingColumnsParams.h>
-#include <base/sort.h>
 #if ENABLE_DISTRIBUTED_CACHE
 #    include <Disks/IO/WriteBufferFromDistributedCache.h>
 #endif
+#include <base/sort.h>
 #include <base/types.h>
 #include <Common/Config/ConfigReloader.h>
 #include <Common/HTTPConnectionPool.h>
@@ -182,6 +183,17 @@ A value of `0` means unlimited.
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
 Maximum total number of threads to use for parsing input.
 )", 0) \
+    DECLARE(UInt64, max_iceberg_manifest_decode_thread_pool_size, 100, R"(
+Maximum total number of threads to use for decoding Iceberg data manifest files.
+
+The pool is separate from the IO pool on purpose: a decode task can block until the query consumes the entries it has produced, while the delete manifest decode waits for its tasks on the IO pool before any entry is consumed - sharing one pool could deadlock.
+)", 0) \
+    DECLARE(UInt64, max_iceberg_manifest_decode_thread_pool_free_size, 0, R"(
+Maximum number of idle standby threads to keep in the thread pool for decoding Iceberg data manifest files.
+)", 0) \
+    DECLARE(UInt64, iceberg_manifest_decode_thread_pool_queue_size, 10000, R"(
+The maximum number of jobs that can be scheduled on the thread pool for decoding Iceberg data manifest files.
+)", 0) \
     DECLARE(UInt64, max_format_parsing_thread_pool_free_size, 0, R"(
 Maximum number of idle standby threads to keep in the thread pool for parsing input.
 )", 0) \
@@ -253,6 +265,19 @@ A value of `0` (default) means unlimited.
     DECLARE(Bool, asynchronous_metrics_enable_heavy_metrics, false, R"(Enable the calculation of heavy asynchronous metrics.)", 0) \
     DECLARE(UInt32, asynchronous_heavy_metrics_update_period_s, 120, R"(Period in seconds for updating heavy asynchronous metrics.)", 0) \
     DECLARE(Bool, asynchronous_metrics_keeper_metrics_only, false, R"(Make asynchronous metrics calculate the keeper-related metrics only.)", 0) \
+    DECLARE(AsynchronousMetricsKeyValuesMode, asynchronous_metrics_key_values_mode, AsynchronousMetricsKeyValuesMode::KeyValues, R"(
+In which form the key-value asynchronous metrics - those broken down per CPU core, block device, network interface, disk, temperature sensor, memory controller or logging channel - are published to [`system.asynchronous_metrics`](/reference/system-tables/asynchronous_metrics), [`system.asynchronous_metric_log`](/reference/system-tables/asynchronous_metric_log), the Prometheus endpoint and Graphite.
+
+Possible values:
+
+- `key_values` - every family is a single key-value metric: a `Map` in the `key_values` column of `system.asynchronous_metrics`, one row per key in `system.asynchronous_metric_log`, one Prometheus sample per key carrying a label such as `device="sda"`, and a `<prefix>.<Metric>.<key>` Graphite path.
+- `legacy_names` - every key is a separate scalar metric with the key mangled into its name, as it was before version 26.8: `OSUserTimeCPU3`, `CPUFrequencyMHz_0`, `BlockReadBytes_sda`, `NetworkReceiveBytes_eth0`, `DiskTotal_default`, `Temperature0`, `EDAC0_Correctable`, and so on.
+- `both` - both forms are published at once, which is useful while the monitoring is being migrated. Beware of double counting in this mode: an aggregate over metric names matching a prefix, such as `sum(value) ... WHERE metric LIKE 'NetworkReceiveBytes%'`, counts every value twice.
+
+A key-value metric family introduced after version 26.8 has no legacy name and is always published in the key-value form.
+
+The setting is applied on the fly: it is re-read on every update of the asynchronous metrics, so `SYSTEM RELOAD CONFIG` is enough to switch the form without a restart.
+)", 0) \
     DECLARE(String, default_database, "default", R"(The default database name.)", 0) \
     DECLARE(String, default_session_user, "default", R"(
 The user name that is used for authentication when a client connects without specifying a user name: an HTTP request without the `user` parameter and `X-ClickHouse-User` header, a native protocol `Hello` packet with an empty user name, a MySQL or PostgreSQL handshake with an empty user name, a gRPC query without `user_name`, an Arrow Flight call without an `authorization` header (or with Basic credentials with an empty user name), or a [web terminal](/interfaces/web-terminal) WebSocket `auth` message with an omitted or empty `user` field.
@@ -1380,6 +1405,8 @@ Maximum size of batch for MultiRead request to [Zoo]Keeper that support batching
     DECLARE(UInt64, drop_distributed_cache_queue_size, 1000, R"(The queue size of the threadpool used for dropping distributed cache.)", 0) \
     DECLARE(UInt64, distributed_cache_write_pool_size, 100, R"(The maximum number of distributed cache write requests that run on a background thread at the same time (across all queries). When the limit is reached, a write goes through the cache inline (on the calling thread) instead of on a background thread, so it neither blocks waiting for a slot nor creates an unbounded number of threads.)", 0) \
     DECLARE(Bool, distributed_cache_apply_throttling_settings_from_client, true, R"(Whether cache server should apply throttling settings received from client.)", 0) \
+    DECLARE(Bool, enable_read_through_distributed_cache, false, R"(Only has an effect in ClickHouse Cloud. Allow reading from distributed cache. This is a server-level switch, applied without a restart, so that background operations which do not have a query profile of their own (merges, mutations, `Buffer` table flushes) follow it as well. Individual queries can deviate from it with the `force_read_through_distributed_cache` setting.)", 0) \
+    DECLARE(Bool, enable_write_through_distributed_cache, false, R"(Only has an effect in ClickHouse Cloud. Allow writing to distributed cache (writing to s3 will also be done by distributed cache). This is a server-level switch, applied without a restart, so that background operations which do not have a query profile of their own (merges, mutations, `Buffer` table flushes) follow it as well. Individual queries can deviate from it with the `force_write_through_distributed_cache` setting.)", 0) \
     DECLARE(UInt32, allow_feature_tier, 0, R"(
 Controls if the user can change settings related to the different feature tiers.
 
@@ -1859,7 +1886,7 @@ Configured as `named_collections_storage.type` (`<named_collections_storage><typ
     DECLARE(String, logger_shutdown_level, "", R"(Shutdown level is used to set the root logger level at server Shutdown.)", 0, "logger.shutdown_level") \
     DECLARE(String, openssl_server_private_key_file, "", R"(Path to the file with the secret key of the PEM certificate. The file may contain a key and certificate at the same time.)", 0, "openSSL.server.privateKeyFile") \
     DECLARE(String, openssl_server_certificate_file, "", R"(Path to the client/server certificate file in PEM format. You can omit it if `<privateKeyFile>` contains the certificate.)", 0, "openSSL.server.certificateFile") \
-    DECLARE(String, openssl_server_ca_config, "", R"(Path to the file or directory that contains trusted CA certificates. If this points to a file, it must be in PEM format and can contain several CA certificates. If this points to a directory, it must contain one .pem file per CA certificate. The filenames are looked up by the CA subject name hash value. Details can be found in the man page of [SSL_CTX_load_verify_locations](https://docs.openssl.org/3.0/man3/SSL_CTX_load_verify_locations/).)", 0, "openSSL.server.caConfig") \
+    DECLARE(String, openssl_server_ca_config, "", R"(Path to the file or directory that contains trusted CA certificates. If this points to a file, it must be in PEM format and can contain several CA certificates. If this points to a directory, it must contain one .pem file per CA certificate. The filenames are looked up by the CA subject name hash value. Details can be found in the man page of [SSL_CTX_load_verify_locations](https://docs.openssl.org/3.0/man3/SSL_CTX_load_verify_locations/). The CA certificates are reloaded without a restart when the file changes or on `SYSTEM RELOAD CONFIG`; new connections are verified against the reloaded certificates.)", 0, "openSSL.server.caConfig") \
     DECLARE(String, openssl_server_verification_mode, "relaxed", R"(The method for checking the node's certificates. Details are in the description of the [Context](https://github.com/ClickHouse/poco/blob/master/NetSSL_OpenSSL/include/Poco/Net/Context.h) class. Possible values: `<none>`, `<relaxed>`, `<strict>`, `<once>`.)", 0, "openSSL.server.verificationMode") \
     DECLARE(UInt64, openssl_server_verification_depth, 9, R"(The maximum length of the verification chain. Verification will fail if the certificate chain length exceeds the set value.)", 0, "openSSL.server.verificationDepth") \
     DECLARE(Bool, openssl_server_load_default_ca_file, true, R"(Determines whether built-in CA certificates for OpenSSL will be used. ClickHouse assumes that builtin CA certificates are in the file `</etc/ssl/cert.pem>` (resp. the directory `</etc/ssl/certs>`) or in file (resp. directory) specified by the environment variable `<SSL_CERT_FILE>` (resp. `<SSL_CERT_DIR>`).)", 0, "openSSL.server.loadDefaultCAFile") \
@@ -1879,7 +1906,7 @@ Configured as `named_collections_storage.type` (`<named_collections_storage><typ
     DECLARE(Bool, openssl_server_prefer_server_ciphers, false, R"(Client-preferred server ciphers.)", 0, "openSSL.server.preferServerCiphers") \
     DECLARE(String, openssl_client_private_key_file, "", R"(Path to the file with the secret key of the PEM certificate. The file may contain a key and certificate at the same time.)", 0, "openSSL.client.privateKeyFile") \
     DECLARE(String, openssl_client_certificate_file, "", R"(Path to the client/server certificate file in PEM format. You can omit it if `<privateKeyFile>` contains the certificate.)", 0, "openSSL.client.certificateFile") \
-    DECLARE(String, openssl_client_ca_config, "", R"(Path to the file or directory that contains trusted CA certificates. If this points to a file, it must be in PEM format and can contain several CA certificates. If this points to a directory, it must contain one .pem file per CA certificate. The filenames are looked up by the CA subject name hash value. Details can be found in the man page of [SSL_CTX_load_verify_locations](https://docs.openssl.org/3.0/man3/SSL_CTX_load_verify_locations/).)", 0, "openSSL.client.caConfig") \
+    DECLARE(String, openssl_client_ca_config, "", R"(Path to the file or directory that contains trusted CA certificates. If this points to a file, it must be in PEM format and can contain several CA certificates. If this points to a directory, it must contain one .pem file per CA certificate. The filenames are looked up by the CA subject name hash value. Details can be found in the man page of [SSL_CTX_load_verify_locations](https://docs.openssl.org/3.0/man3/SSL_CTX_load_verify_locations/). The CA certificates are reloaded without a restart when the file changes or on `SYSTEM RELOAD CONFIG`; new connections are verified against the reloaded certificates.)", 0, "openSSL.client.caConfig") \
     DECLARE(String, openssl_client_verification_mode, "relaxed", R"(The method for checking the node's certificates. Details are in the description of the [Context](https://github.com/ClickHouse/poco/blob/master/NetSSL_OpenSSL/include/Poco/Net/Context.h) class. Possible values: `<none>`, `<relaxed>`, `<strict>`, `<once>`.)", 0, "openSSL.client.verificationMode") \
     DECLARE(UInt64, openssl_client_verification_depth, 9, R"(The maximum length of the verification chain. Verification will fail if the certificate chain length exceeds the set value.)", 0, "openSSL.client.verificationDepth") \
     DECLARE(Bool, openssl_client_load_default_ca_file, true, R"(Determines whether built-in CA certificates for OpenSSL will be used. ClickHouse assumes that builtin CA certificates are in the file `</etc/ssl/cert.pem>` (resp. the directory `</etc/ssl/certs>`) or in file (resp. directory) specified by the environment variable `<SSL_CERT_FILE>` (resp. `<SSL_CERT_DIR>`).)", 0, "openSSL.client.loadDefaultCAFile") \
@@ -2237,6 +2264,10 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
         "stateless_worker_server",
         "stateless_worker_discovery_service",
         "_functional_tests_helper_shared_catalog",
+        /// Shared-catalog analog of `_functional_tests_helper_database_replicated_replace_args_macros`,
+        /// injected into the server config by the private SharedCatalog functional-test setup
+        /// (`tests/config/config.d/shared_catalog.xml`).
+        "_functional_tests_helper_shared_catalog_replace_args_macros",
         "server_uuid_from_replica_name",
         "cloud",
         "default_user_for_system_dictionaries",
@@ -3491,6 +3522,11 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
             {"named_collections_storage_type",
              {context->getServerSettingsCopy()[ServerSetting::named_collections_storage_type].toString(), ChangeableWithoutRestart::No}},
 
+            /// Re-read from the live configuration on every update of the asynchronous metrics.
+            {"asynchronous_metrics_key_values_mode",
+             {SettingFieldAsynchronousMetricsKeyValuesMode(getAsynchronousMetricsKeyValuesMode(context->getConfigRef())).toString(),
+              ChangeableWithoutRestart::Yes}},
+
             {"max_table_size_to_drop", {std::to_string(context->getMaxTableSizeToDrop()), ChangeableWithoutRestart::Yes}},
             {"max_named_collection_num_to_warn", {std::to_string(context->getMaxNamedCollectionNumToWarn()), ChangeableWithoutRestart::Yes}},
             {"max_table_num_to_warn", {std::to_string(context->getMaxTableNumToWarn()), ChangeableWithoutRestart::Yes}},
@@ -3565,6 +3601,9 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
             {"s3queue_disable_streaming",
              {std::to_string(context->getServerSettingsCopy().get("s3queue_disable_streaming").safeGet<bool>()), ChangeableWithoutRestart::Yes}},
             {"message_queue_disable_insertion", {std::to_string(context->getMessageQueueDisableInsertion()), ChangeableWithoutRestart::No}},
+            {"enable_read_through_distributed_cache", {std::to_string(context->getReadThroughDistributedCache()), ChangeableWithoutRestart::Yes}},
+            {"enable_write_through_distributed_cache", {std::to_string(context->getWriteThroughDistributedCache()), ChangeableWithoutRestart::Yes}},
+
             {"max_remote_read_network_bandwidth_for_server",
              {context->getRemoteReadThrottler() ? std::to_string(context->getRemoteReadThrottler()->getMaxSpeed()) : "0", ChangeableWithoutRestart::Yes}},
             {"max_remote_write_network_bandwidth_for_server",
@@ -3617,6 +3656,12 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
              {getFormatParsingThreadPool().isInitialized() ? std::to_string(getFormatParsingThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
             {"format_parsing_thread_pool_queue_size",
              {getFormatParsingThreadPool().isInitialized() ? std::to_string(getFormatParsingThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
+            {"max_iceberg_manifest_decode_thread_pool_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getMaxThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"max_iceberg_manifest_decode_thread_pool_free_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"iceberg_manifest_decode_thread_pool_queue_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
 
             {"abort_on_logical_error", {std::to_string(DB::abort_on_logical_error), ChangeableWithoutRestart::Yes}},
 
@@ -3706,8 +3751,8 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
         const bool is_changeable = (changeable_settings_it != changeable_settings.end());
 
         res_columns[0]->insert(setting_path.empty() ? setting_name : setting_path);
-        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString());
-        res_columns[2]->insert(setting.getDefaultValueString());
+        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString(/* show_secrets */ true));
+        res_columns[2]->insert(setting.getDefaultValueString(/* show_secrets */ true));
         res_columns[3]->insert(setting.isValueChanged());
         res_columns[4]->insert(setting.getDescription());
         res_columns[5]->insert(setting.getTypeName());

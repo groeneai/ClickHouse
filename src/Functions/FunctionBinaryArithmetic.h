@@ -1867,7 +1867,8 @@ class FunctionBinaryArithmetic : public IFunction, WithContext
             ? array_element_function->executeImpl(new_arguments, result_array_type, rows_count)
             : executeImpl(new_arguments, result_array_type, rows_count);
 
-        return ColumnArray::create(res, typeid_cast<const ColumnArray *>(arguments[0].column.get())->getOffsetsPtr());
+        /// The element-wise result can be a constant (for example a NULL), the data of an array cannot.
+        return ColumnArray::create(res->convertToFullColumnIfConst(), typeid_cast<const ColumnArray *>(arguments[0].column.get())->getOffsetsPtr());
     }
 
     ColumnPtr executeArrayWithNumericImpl(const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const
@@ -3184,6 +3185,21 @@ ColumnPtr executeStringInteger(const ColumnsWithTypeAndName & arguments, const A
     {
         const auto & left_argument = arguments[0];
         const auto & right_argument = arguments[1];
+
+        /// A constant's value is independent of its size, but the null map carrying the
+        /// division-by-zero outcome has one entry per row, so a zero-row call keeps the value and
+        /// loses the NULL. Constant arguments give the same answer for every row.
+        if constexpr (is_division_or_null)
+        {
+            if (input_rows_count == 0 && result_type->isNullable() && !right_nullmap && !result_nullmap
+                && isColumnConst(*left_argument.column) && isColumnConst(*right_argument.column))
+            {
+                ColumnsWithTypeAndName one_row = arguments;
+                for (auto & argument : one_row)
+                    argument.column = argument.column->cloneResized(1);
+                return executeImpl2(one_row, result_type, 1)->cloneResized(0);
+            }
+        }
 
         /// Process special case when operation is divide, intDiv or modulo and denominator
         /// is Nullable(Something) to prevent division by zero error.

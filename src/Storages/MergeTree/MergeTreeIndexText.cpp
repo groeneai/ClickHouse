@@ -1,5 +1,4 @@
 #include <Storages/MergeTree/MergeTreeIndexText.h>
-#include <Storages/MergeTree/IMergeTreeDataPartInfoForReader.h>
 #include <Storages/MergeTree/TextIndexAnalyzer.h>
 
 #include <Columns/ColumnArray.h>
@@ -392,7 +391,7 @@ ColumnPtr deserializeTokensRaw(ReadBuffer & istr, size_t num_tokens)
     tokens_column->reserve(num_tokens);
 
     auto serialization_string = SerializationString::create();
-    serialization_string->deserializeBinaryBulk(*tokens_column, istr, 0, num_tokens, 0.0);
+    serialization_string->deserializeBinaryBulk(*tokens_column, istr, num_tokens, 0.0);
 
     return tokens_column;
 }
@@ -492,7 +491,7 @@ void MergeTreeIndexGranuleText::deserializeBinaryWithMultipleStreams(MergeTreeIn
 
     if (index_id_for_caches.empty())
     {
-        const auto & part_storage = *state.part_info.getDataPartStorage();
+        const auto & part_storage = state.part.getDataPartStorage();
         index_id_for_caches = fmt::format("{}:{}:{}", part_storage.getDiskName(), part_storage.getFullPath(), state.index.getFileName());
     }
 
@@ -502,7 +501,7 @@ void MergeTreeIndexGranuleText::deserializeBinaryWithMultipleStreams(MergeTreeIn
     /// Push the row ranges still readable after the analysis of the primary key and prior skip indexes into the analyzer.
     if (state.readable_ranges)
     {
-        const auto & index_granularity = state.part_info.getIndexGranularity();
+        const auto & index_granularity = *state.part.index_granularity;
         std::vector<RowsRange> readable_row_ranges;
         readable_row_ranges.reserve(state.readable_ranges->size());
 
@@ -529,7 +528,7 @@ void MergeTreeIndexGranuleText::deserializeBinaryWithMultipleStreams(MergeTreeIn
         analyzePostings(postings_serialization, *postings_stream, state);
 
     const auto & settings = condition_text.getContext()->getSettingsRef();
-    analyzer->analyzeCardinalitiesAndBypassHints(static_cast<double>(settings[Setting::text_index_hint_max_selectivity]), state.part_info.getRowCount());
+    analyzer->analyzeCardinalitiesAndBypassHints(static_cast<double>(settings[Setting::text_index_hint_max_selectivity]), state.part.rows_count);
 
     /// Capture the codec after the analysis — for pre-WithCodec parts the
     /// codec may have been lazily installed while decoding an IsCompressed posting list.
@@ -550,7 +549,7 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForTokens(
 
     if (tokens_to_read.empty() || analyzer->alwaysFalse())
     {
-        cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part_info.getRowCount());
+        cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part.rows_count);
         return;
     }
 
@@ -558,7 +557,7 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForTokens(
     const bool use_negative_tokens_cache = condition_text.getContext()->getSettingsRef()[Setting::use_text_index_negative_tokens_cache];
     cardinalities_cache->sortTokens(tokens_to_read);
 
-    LOG_TEST(getLogger("MergeTreeIndexGranuleText"), "Reading tokens {} from part {}", toString(tokens_to_read), state.part_info.getDataPartStorage()->getFullPath());
+    LOG_TEST(getLogger("MergeTreeIndexGranuleText"), "Reading tokens {} from part {}", toString(tokens_to_read), state.part.getDataPartStorage().getFullPath());
 
     /// Collect blocks ids in the same order as tokens are sorted by cardinality.
     std::vector<size_t> blocks_ids_to_read;
@@ -611,7 +610,7 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForTokens(
 
         if (analyzer->alwaysFalse())
         {
-            cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part_info.getRowCount());
+            cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part.rows_count);
             return;
         }
 
@@ -628,12 +627,12 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForTokens(
 
         if (analyzer->alwaysFalse())
         {
-            cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part_info.getRowCount());
+            cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part.rows_count);
             return;
         }
     }
 
-    cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part_info.getRowCount());
+    cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part.rows_count);
 }
 
 void MergeTreeIndexGranuleText::analyzeDictionaryForPatterns(
@@ -1258,7 +1257,7 @@ TextIndexHeader TextIndexSerialization::deserializeHeader(ReadBuffer & istr)
     auto offsets = ColumnUInt64::create();
 
     auto serialization_number = SerializationNumber<UInt64>::create();
-    serialization_number->deserializeBinaryBulk(*offsets, istr, 0, num_sparse_index_tokens, 0.0);
+    serialization_number->deserializeBinaryBulk(*offsets, istr, num_sparse_index_tokens, 0.0);
     header.sparse_index = DictionarySparseIndex(std::move(tokens), std::move(offsets));
     return header;
 }
@@ -1937,10 +1936,9 @@ MergeTreeIndexSubstreams MergeTreeIndexText::getSubstreams() const
     return substreams;
 }
 
-MergeTreeIndexFormat MergeTreeIndexText::getPhysicalFormat(
-    const MergeTreeDataPartChecksums & checksums, const IDataPartStorage & storage, const std::string & relative_path_prefix) const
+MergeTreeIndexFormat MergeTreeIndexText::getPhysicalFormat(const IMergeTreeDataPart & part, const std::string & relative_path_prefix) const
 {
-    if (!indexFileExistsInChecksums(checksums, relative_path_prefix, ".idx", &storage))
+    if (!indexFileExistsInChecksums(part.checksums, relative_path_prefix, ".idx", &part.getDataPartStorage()))
         return {0, {}};
 
     MergeTreeIndexSubstreams substreams =
@@ -1951,7 +1949,7 @@ MergeTreeIndexFormat MergeTreeIndexText::getPhysicalFormat(
     };
 
     /// V2: positions file exists on disk.
-    if (indexFileExistsInChecksums(checksums, relative_path_prefix + ".pos", ".idx", &storage))
+    if (indexFileExistsInChecksums(part.checksums, relative_path_prefix + ".pos", ".idx", part.getDataPartStoragePtr().get()))
     {
         substreams.push_back({MergeTreeIndexSubstream::Type::TextIndexPositions, ".pos", ".idx"});
         return {2, std::move(substreams)};

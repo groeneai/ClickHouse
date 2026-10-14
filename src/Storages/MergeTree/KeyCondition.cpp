@@ -5,6 +5,7 @@
 #include <Core/AccurateComparison.h>
 #include <Core/PlainRanges.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -64,6 +65,7 @@ namespace Setting
     extern const SettingsBool analyze_index_with_space_filling_curves;
     extern const SettingsDateTimeOverflowBehavior date_time_overflow_behavior;
     extern const SettingsTimezone session_timezone;
+    extern const SettingsBool validate_enum_literals_in_operators;
 }
 
 namespace ErrorCodes
@@ -1473,6 +1475,7 @@ KeyCondition::KeyCondition(
     , single_point(single_point_)
     , date_time_overflow_behavior_ignore(
           context->getSettingsRef()[Setting::date_time_overflow_behavior] == FormatSettings::DateTimeOverflowBehavior::Ignore)
+    , validate_enum_literals_in_operators(context->getSettingsRef()[Setting::validate_enum_literals_in_operators])
 {
     size_t key_index = 0;
     for (const auto & name : key_column_names_)
@@ -4085,6 +4088,27 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
                                 return false;
                         }
 
+                        /// With validation off, `equals`/`notEquals` fold an unknown enum literal to a
+                        /// constant instead of throwing, so the index must do the same instead of converting.
+                        /// Nullable keys are declined, as for NaN above: `NULL <op> 'x'` is NULL, not a constant.
+                        if (!validate_enum_literals_in_operators && isUnknownEnumElement(*key_expr_type_not_null, const_value))
+                        {
+                            if (key_expr_type_is_nullable)
+                                return false;
+
+                            if (func_name == "equals")
+                            {
+                                out.function = RPNElement::ALWAYS_FALSE;
+                                return true;
+                            }
+                            if (func_name == "notEquals")
+                            {
+                                out.function = RPNElement::ALWAYS_TRUE;
+                                return true;
+                            }
+                            return false;
+                        }
+
                         const_value = convertFieldToType(const_value, *key_expr_type_not_null);
                         if (const_value.isNull())
                             return false;
@@ -5644,6 +5668,93 @@ static void tupleRangeToBoundingBox(const Range & tuple_range, Float64 & x_min, 
     }
 }
 
+namespace
+{
+
+/// Whether the analysed range of a key column may hold a NULL value. A NULL key value is analysed as
+/// the `+inf` stand-in of the `NULLS LAST` order, so every range that reaches `+inf` may hold one.
+bool rangeOfKeyColumnMayHoldNull(const Range & key_range, const DataTypes & key_types, size_t key_position)
+{
+    return key_range.right.isPositiveInfinity() && key_position < key_types.size() && key_types[key_position]
+        && isNullableOrLowCardinalityNullable(key_types[key_position]);
+}
+
+/// Whether the atom answers NULL - and hence "not true" to `WHERE` - for a NULL argument, instead of
+/// answering true or false as `IS NULL` and `IS NOT NULL` do.
+bool atomIsNullForNullArgument(KeyCondition::RPNElement::Function function)
+{
+    switch (function)
+    {
+        case KeyCondition::RPNElement::FUNCTION_IN_RANGE:
+        case KeyCondition::RPNElement::FUNCTION_NOT_IN_RANGE:
+        case KeyCondition::RPNElement::FUNCTION_IN_SET:
+        case KeyCondition::RPNElement::FUNCTION_NOT_IN_SET:
+        case KeyCondition::RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
+        case KeyCondition::RPNElement::FUNCTION_POINT_IN_POLYGON:
+            return true;
+        case KeyCondition::RPNElement::FUNCTION_IS_NULL:
+        case KeyCondition::RPNElement::FUNCTION_IS_NOT_NULL:
+        case KeyCondition::RPNElement::FUNCTION_UNKNOWN:
+        case KeyCondition::RPNElement::FUNCTION_NOT:
+        case KeyCondition::RPNElement::FUNCTION_AND:
+        case KeyCondition::RPNElement::FUNCTION_OR:
+        case KeyCondition::RPNElement::ALWAYS_FALSE:
+        case KeyCondition::RPNElement::ALWAYS_TRUE:
+            return false;
+    }
+}
+
+}
+
+/// `WHERE` rejects a row whose comparison is NULL, so a NULL key value satisfies neither a comparison
+/// nor its negation. The two-valued range algebra of `checkInHyperrectangle` cannot express that: "no
+/// NULL row lies inside the range" turns, under negation, into "every row lies outside it", which
+/// reports a granule of NULLs as wholly matching a negated comparison - and the exact-count
+/// optimization then counts the very rows the `WHERE` throws away. So the exactness of the whole
+/// analysis is gone as soon as one such atom reads a `Nullable` key column whose range may hold a
+/// NULL. `IS NULL` and `IS NOT NULL` are excluded: they answer true or false for a NULL as well, so
+/// the algebra describes them exactly. Only `can_be_false` is affected; `can_be_true`, and with it
+/// every pruning decision, is left alone.
+bool KeyCondition::mayReadNullKeyValue(const Hyperrectangle & hyperrectangle, const DataTypes & key_types) const
+{
+    for (const auto & element : rpn)
+    {
+        if (!atomIsNullForNullArgument(element.function))
+            continue;
+
+        for (size_t key_column : element.key_columns)
+            if (key_column < hyperrectangle.size() && rangeOfKeyColumnMayHoldNull(hyperrectangle[key_column], key_types, key_column))
+                return true;
+    }
+
+    return false;
+}
+
+/// The same over the sparse representation of the primary index, where a key column is addressed by
+/// its position among the columns the index resolves.
+bool KeyCondition::mayReadNullKeyValue(
+    const std::vector<int> & key_col_to_sparse_pos, const Hyperrectangle & sparse_hyperrectangle, const DataTypes & sparse_key_types) const
+{
+    for (const auto & element : rpn)
+    {
+        if (!atomIsNullForNullArgument(element.function))
+            continue;
+
+        for (size_t key_column : element.key_columns)
+        {
+            if (key_column >= key_col_to_sparse_pos.size() || key_col_to_sparse_pos[key_column] == -1)
+                continue;
+
+            const size_t sparse_pos = static_cast<size_t>(key_col_to_sparse_pos[key_column]);
+            if (sparse_pos < sparse_hyperrectangle.size()
+                && rangeOfKeyColumnMayHoldNull(sparse_hyperrectangle[sparse_pos], sparse_key_types, sparse_pos))
+                return true;
+        }
+    }
+
+    return false;
+}
+
 BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
@@ -5660,9 +5771,12 @@ BoolMask KeyCondition::checkInHyperrectangle(
         return SpaceFillingCurveType::Unknown;
     };
 
-    size_t element_idx = 0;
-    for (const auto & element : rpn)
+    /// The reported position is the element's index in `rpn`: the disjunction bitset is read positionally
+    /// against the template RPN. A position that is never reported keeps the bitset's all-true default.
+    for (size_t element_idx = 0; element_idx < rpn.size(); ++element_idx)
     {
+        const auto & element = rpn[element_idx];
+
         if (element.argument_num_of_space_filling_curve.has_value())
         {
             /// If a condition on argument of a space filling curve wasn't collapsed into FUNCTION_ARGS_IN_HYPERRECTANGLE,
@@ -6068,14 +6182,14 @@ BoolMask KeyCondition::checkInHyperrectangle(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type in KeyCondition::RPNElement");
 
         if (update_partial_disjunction_result_fn)
-        {
             update_partial_disjunction_result_fn(element_idx, rpn_stack.back().can_be_true, (element.function == RPNElement::FUNCTION_UNKNOWN));
-            ++element_idx;
-        }
     }
 
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
+
+    if (unlikely(!rpn_stack[0].can_be_false && mayReadNullKeyValue(hyperrectangle, data_types)))
+        rpn_stack[0].can_be_false = true;
 
     return rpn_stack[0];
 }
@@ -6564,6 +6678,9 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
+
+    if (unlikely(!rpn_stack[0].can_be_false && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
+        rpn_stack[0].can_be_false = true;
 
     return rpn_stack[0];
 }

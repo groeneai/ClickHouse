@@ -93,7 +93,6 @@ void optimizeTreeFirstPass(const QueryPlanOptimizationSettings & optimization_se
         optimization_settings.use_skip_indexes_on_data_read,
         optimization_settings.read_in_order,
         optimization_settings.read_in_order_through_join,
-        optimization_settings.read_in_order_through_spilling_join,
         optimization_settings.join_swap_table,
         optimization_settings.enable_group_by_top_k_optimization,
         optimization_settings.top_k_optimization_observation_rows,
@@ -103,6 +102,7 @@ void optimizeTreeFirstPass(const QueryPlanOptimizationSettings & optimization_se
         optimization_settings.push_down_volume_reducing_functions,
         optimization_settings.make_distributed_plan,
         optimization_settings.serialize_query_plan,
+        optimization_settings.filter_push_down_below_limit_by,
     };
 
     while (!stack.empty())
@@ -224,7 +224,6 @@ void optimizeTreeSecondPass(
         optimization_settings.use_skip_indexes_on_data_read,
         optimization_settings.read_in_order,
         optimization_settings.read_in_order_through_join,
-        optimization_settings.read_in_order_through_spilling_join,
         optimization_settings.join_swap_table,
         optimization_settings.enable_group_by_top_k_optimization,
         optimization_settings.top_k_optimization_observation_rows,
@@ -234,6 +233,7 @@ void optimizeTreeSecondPass(
         optimization_settings.push_down_volume_reducing_functions,
         optimization_settings.make_distributed_plan,
         optimization_settings.serialize_query_plan,
+        optimization_settings.filter_push_down_below_limit_by,
     };
 
     Stack stack;
@@ -309,6 +309,11 @@ void optimizeTreeSecondPass(
     /// to move newly added runtime filter as deep in the tree as possible
     if (join_runtime_filters_were_added)
     {
+        /// The re-run passes default `ExtraSettings`, except for the `LIMIT BY` gate: this pass also pushes
+        /// filters below `LIMIT BY`, so it must follow `query_plan_filter_push_down_below_limit_by` too.
+        Optimization::ExtraSettings push_down_settings{};
+        push_down_settings.filter_push_down_below_limit_by = optimization_settings.filter_push_down_below_limit_by;
+
         traverseQueryPlan(stack, root,
             [&](auto & frame_node)
             {
@@ -318,7 +323,7 @@ void optimizeTreeSecondPass(
                     size_t changed_nodes = 0;
                     changed_nodes += tryMergeExpressions(&frame_node, nodes, {});
                     changed_nodes += tryMergeFilters(&frame_node, nodes, {});
-                    changed_nodes += tryPushDownFilter(&frame_node, nodes, {});
+                    changed_nodes += tryPushDownFilter(&frame_node, nodes, push_down_settings);
 
                     if (!changed_nodes)
                         break;
@@ -569,8 +574,6 @@ void optimizeTreeSecondPass(
                 const QueryPlanOptimizationSettings subquery_optimization_settings(local_context);
                 local_optimization_settings.read_in_order = subquery_optimization_settings.read_in_order;
                 local_optimization_settings.read_in_order_through_join = subquery_optimization_settings.read_in_order_through_join;
-                local_optimization_settings.read_in_order_through_spilling_join
-                    = subquery_optimization_settings.read_in_order_through_spilling_join;
                 local_optimization_settings.aggregation_in_order = subquery_optimization_settings.aggregation_in_order;
                 local_optimization_settings.distinct_in_order = subquery_optimization_settings.distinct_in_order;
                 local_optimization_settings.reuse_storage_ordering_for_window_functions

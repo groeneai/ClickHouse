@@ -831,6 +831,7 @@ public:
         MAX_PENDING_MUTATIONS_OVER_THRESHOLD,
         MAYBE_BROKEN_TABLES,
         MERGE_TREE_JEMALLOC_ARENA_POOL_DEGRADED,
+        JEMALLOC_PERCPU_ARENA_DISABLED,
         OBSOLETE_MONGO_TABLE_DEFINITION,
         OBSOLETE_SETTINGS,
         PROCESS_USER_MATCHES_DATA_OWNER,
@@ -1023,7 +1024,6 @@ public:
     void increaseDistributedDepth();
     const OpenTelemetry::TracingContext & getClientTraceContext() const { return client_info.client_trace_context; }
     OpenTelemetry::TracingContext & getClientTraceContext() { return client_info.client_trace_context; }
-    void setClientTraceContext(const OpenTelemetry::TracingContext & trace_context);
 
     enum StorageNamespace
     {
@@ -1156,6 +1156,7 @@ public:
 
     void addViewSource(const StoragePtr & storage);
     StoragePtr getViewSource() const;
+    void clearViewSource();
 
     String getCurrentDatabase() const;
     String getCurrentQueryId() const { return client_info.current_query_id; }
@@ -1228,6 +1229,8 @@ public:
     void checkSettingsConstraints(const SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraints(SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, SettingSource source);
+    /// For the resets of a statement that also changes `profile`: `changes_applied_first` decides their constraints.
+    void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source);
     void clampToSettingsConstraints(SettingsChanges & changes, SettingSource source);
     void checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const;
 
@@ -1359,6 +1362,20 @@ public:
 
     bool getMessageQueueDisableInsertion() const;
 
+    /// The server-level distributed cache switches. They live in `shared`, which is common to every context
+    /// (including the background and buffer contexts created once at startup), so a config reload is observed
+    /// by background operations as well. A query may deviate from them with the `force_*` settings.
+    bool getReadThroughDistributedCache() const;
+    void setReadThroughDistributedCache(bool read_through_distributed_cache) const;
+
+    bool getWriteThroughDistributedCache() const;
+    void setWriteThroughDistributedCache(bool write_through_distributed_cache) const;
+
+    /// The switches with this context's `force_*` setting applied. The global context ignores that setting:
+    /// it is the startup snapshot serving operations without a query context, which follow the server switch.
+    bool resolveReadThroughDistributedCache() const;
+    bool resolveWriteThroughDistributedCache() const;
+
     /// The port that the server listens for executing SQL queries.
     UInt16 getTCPPort() const;
 
@@ -1483,7 +1500,8 @@ public:
 #endif
     void initializeKeeperDispatcher(bool start_async) const;
     void signalKeeperDispatcherShutdown() const;
-    void shutdownKeeperDispatcher(bool closed_all_connections) const;
+    void shutdownKeeperDispatcherBeforeConnectionsFinish() const;
+    void shutdownKeeperDispatcherAfterConnectionsFinish(bool closed_all_connections) const;
     void updateKeeperConfiguration(const Poco::Util::AbstractConfiguration & config) const;
 
     /// Set auxiliary zookeepers configuration at server starting or configuration reloading.

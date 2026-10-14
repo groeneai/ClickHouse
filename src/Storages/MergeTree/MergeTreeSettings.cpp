@@ -47,7 +47,6 @@ namespace ErrorCodes
     extern const int UNKNOWN_SETTING;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
-    extern const int READONLY;
 }
 
 // clang-format off
@@ -895,6 +894,17 @@ Minimal amount of data parts which merge selector can pick to merge at once
     DECLARE(Bool, apply_patches_on_merge, true, R"(
 If true patch parts are applied on merges
 )", 0) \
+    DECLARE(MergeTreePatchPartsVersion, patch_parts_version, "v2", R"(
+On-disk serialization version for patch parts produced by lightweight UPDATE queries.
+
+Possible values:
+- `v1` - legacy format: patch parts contain `_part, _part_offset` system columns and are sorted by
+`(_part, _part_offset)`. In the worst case, memory usage during apply is bounded by the size of the whole patch part.
+- `v2` - patch parts carry the main table's sort-key columns and are sorted by
+`(sorting_key_columns..., _block_number, _block_offset)`. Memory usage during apply is bounded by the largest equal-sort-key run.
+
+Old-format patches on disk remain readable regardless of this setting.
+)", 0) \
     \
     DECLARE(UInt64, max_uncompressed_bytes_in_patches, 30ULL * 1024 * 1024 * 1024, R"(
 The maximum uncompressed size of data in all patch parts in bytes.
@@ -1615,6 +1625,20 @@ Only available in ClickHouse Cloud
 Enables requesting FS cache hints from in-memory
 cache on other replicas. Only available in ClickHouse Cloud
 )", 0) \
+    DECLARE(Bool, shared_merge_tree_use_blobs_list_for_parts, false, R"(
+Store parts of a SharedMergeTree table (both Wide and Compact) as a single
+consolidated blob-list metadata node instead of one Keeper node per file.
+Collapses per-part Keeper metadata from O(files) to a small constant while
+keeping one object-storage blob per file. Only available in ClickHouse Cloud.
+)", 0) \
+    DECLARE(UInt64, shared_merge_tree_blobs_list_inline_file_max_bytes, 0, R"(
+Store files of a blob-list part that are at most this many bytes long (e.g.
+count.txt, metadata_version.txt, minmax indexes) directly inside the
+consolidated blobs.list file instead of a separate object-storage blob,
+saving one blob write and read per small file. 0 disables inlining. Takes
+effect only for parts using the blob-list storage (see
+shared_merge_tree_use_blobs_list_for_parts). Only available in ClickHouse Cloud.
+)", 0) \
     DECLARE(Bool, shared_merge_tree_try_fetch_part_in_memory_data_from_replicas, false, R"(
 If enabled all the replicas try to fetch part in memory data (like primary
 key, partition info and so on) from other replicas where it already exists.
@@ -2191,7 +2215,7 @@ Possible values:
 Enables commit-order projections that store `_block_number` and `_block_offset` virtual columns, preserving original insertion order through merges.
 Requires `enable_block_number_column` and `enable_block_offset_column` to be enabled.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, allow_experimental_adaptive_codec_selection, false, R"(
+    DECLARE(Bool, enable_adaptive_codec_selection, false, R"(
 When enabled, merges and mutations choose a codec per block for columns that use the default codec (no `CODEC` clause, or `CODEC(Default)`).
 The candidates are the table's default codec (see the `default_compression_codec` setting), `NONE`, and specialized codecs suited to the column type.
 Only integer-like types are currently adaptive.
@@ -2204,9 +2228,6 @@ Notify newest block number to SharedJoin or SharedSet. Only in ClickHouse Cloud.
 )", EXPERIMENTAL) \
     DECLARE(UInt64, shared_merge_tree_virtual_parts_discovery_batch, 1, R"(
 How many partition discoveries should be packed into batch
-)", 0) \
-    DECLARE(Bool, shared_merge_tree_virtual_parts_partition_atomic_discovery, true, R"(
-Will SMT discover virtual parts partition atomically with extra data fetch and watches setup.
 )", 0) \
     DECLARE(Bool, shared_merge_tree_enable_automatic_empty_partitions_cleanup, true, R"(
 Enabled cleanup of Keeper entries of empty partition.
@@ -2413,6 +2434,7 @@ are also created during INSERTs with [materialize_projections_on_insert](/refere
     MAKE_OBSOLETE_MERGE_TREE_SETTING(M, UInt64, cleanup_threads, 128) \
     MAKE_OBSOLETE_MERGE_TREE_SETTING(M, Bool, allow_experimental_reverse_key, false) \
     MAKE_OBSOLETE_MERGE_TREE_SETTING(M, Bool, use_async_block_ids_cache, true) \
+    MAKE_OBSOLETE_MERGE_TREE_SETTING(M, Bool, shared_merge_tree_virtual_parts_partition_atomic_discovery, true) \
 
     /// Settings that should not change after the creation of a table.
     /// NOLINTNEXTLINE
@@ -2436,12 +2458,7 @@ struct MergeTreeSettingsImpl : public BaseSettings<MergeTreeSettingsTraits>
     void loadFromQuery(ASTStorage & storage_def, ContextPtr context, bool is_loading_from_existing_metadata, bool for_system_database);
 
     /// Check that the values are sane taking also query-level settings into account.
-    void sanityCheck(
-        size_t background_pool_tasks,
-        bool allow_experimental,
-        bool allow_private_preview,
-        bool allow_beta,
-        bool background_pool_auto_lowered) const;
+    void sanityCheck(size_t background_pool_tasks, bool background_pool_auto_lowered) const;
 
     /// Subscript operators so that MergeTreeSetting::NAME can be used inside Impl methods.
     /// Delegate to `BaseSettings::operator[]` so the Impl->Data subobject offset is handled
@@ -2546,48 +2563,8 @@ void MergeTreeSettingsImpl::loadFromQuery(ASTStorage & storage_def, ContextPtr c
 #undef ADD_IF_ABSENT
 }
 
-void MergeTreeSettingsImpl::sanityCheck(
-    size_t background_pool_tasks,
-    bool allow_experimental,
-    bool allow_private_preview,
-    bool allow_beta,
-    bool background_pool_auto_lowered) const
+void MergeTreeSettingsImpl::sanityCheck(size_t background_pool_tasks, bool background_pool_auto_lowered) const
 {
-    if (!allow_experimental || !allow_private_preview || !allow_beta)
-    {
-        for (const auto & setting : all())
-        {
-            if (!setting.isValueChanged())
-                continue;
-
-            auto tier = setting.getTier();
-            if (!allow_experimental && tier == EXPERIMENTAL)
-            {
-                throw Exception(
-                    ErrorCodes::READONLY,
-                    "Cannot modify setting '{}'. Changes to EXPERIMENTAL settings are disabled in the server config "
-                    "('allow_feature_tier')",
-                    setting.getName());
-            }
-            if (!allow_private_preview && tier == PRIVATE_PREVIEW)
-            {
-                throw Exception(
-                    ErrorCodes::READONLY,
-                    "Cannot modify setting '{}'. Changes to PRIVATE PREVIEW settings are disabled in the server config "
-                    "('allow_feature_tier')",
-                    setting.getName());
-            }
-            if (!allow_beta && tier == BETA)
-            {
-                throw Exception(
-                    ErrorCodes::READONLY,
-                    "Cannot modify setting '{}'. Changes to BETA settings are disabled in the server config ('allow_feature_tier')",
-                    setting.getName());
-            }
-        }
-    }
-
-
     /// Skip these checks when the background pool was auto-lowered by the low-memory heuristic
     /// AND the corresponding table-level threshold is at its default. On small systems the pool
     /// may be tuned below the default thresholds, and we do not want to fail table creation in
@@ -2834,11 +2811,33 @@ SettingsChanges MergeTreeSettings::changes() const
     return impl->changes();
 }
 
+SettingsChanges MergeTreeSettings::changesFrom(const MergeTreeSettings & base) const
+{
+    SettingsChanges res;
+    for (const auto & setting : impl->all())
+    {
+        auto value = setting.getValue();
+        if (value != base.impl->get(setting.getName()))
+            res.emplace_back(String{setting.getName()}, value);
+    }
+    return res;
+}
+
 void MergeTreeSettings::applyChanges(const SettingsChanges & changes, ContextPtr context, bool is_loading_from_existing_metadata)
 {
     auto resolved_changes = changes;
     resolveDiskSetting(resolved_changes, context, is_loading_from_existing_metadata);
     impl->applyChanges(resolved_changes);
+}
+
+void MergeTreeSettings::applyChangesLeavingDiskUnresolved(const SettingsChanges & changes)
+{
+    SettingsChanges changes_without_disk;
+    changes_without_disk.reserve(changes.size());
+    for (const auto & change : changes)
+        if (change.name != "disk")
+            changes_without_disk.push_back(change);
+    impl->applyChanges(changes_without_disk);
 }
 
 void MergeTreeSettings::applyChange(const SettingChange & change, ContextPtr context, bool is_loading_from_existing_metadata)
@@ -2930,7 +2929,7 @@ VectorWithMemoryTracking<std::string_view> MergeTreeSettings::getAllRegisteredNa
     return setting_names;
 }
 
-std::vector<std::string_view> MergeTreeSettings::getAllAliasNames() const
+std::vector<std::string_view> MergeTreeSettings::getAllAliasNames()
 {
     std::vector<std::string_view> alias_names;
     const auto & settings_to_aliases = MergeTreeSettingsImpl::Traits::settingsToAliases();
@@ -2992,14 +2991,9 @@ bool MergeTreeSettings::needSyncPart(size_t input_rows, size_t input_bytes) cons
         || ((*this)[MergeTreeSetting::min_compressed_bytes_to_fsync_after_merge] && input_bytes >= (*this)[MergeTreeSetting::min_compressed_bytes_to_fsync_after_merge]));
 }
 
-void MergeTreeSettings::sanityCheck(
-    size_t background_pool_tasks,
-    bool allow_experimental,
-    bool allow_private_preview,
-    bool allow_beta,
-    bool background_pool_auto_lowered) const
+void MergeTreeSettings::sanityCheck(size_t background_pool_tasks, bool background_pool_auto_lowered) const
 {
-    impl->sanityCheck(background_pool_tasks, allow_experimental, allow_private_preview, allow_beta, background_pool_auto_lowered);
+    impl->sanityCheck(background_pool_tasks, background_pool_auto_lowered);
 }
 
 void MergeTreeSettings::dumpToSystemMergeTreeSettingsColumns(MutableColumnsAndConstraints & params) const
@@ -3012,8 +3006,8 @@ void MergeTreeSettings::dumpToSystemMergeTreeSettingsColumns(MutableColumnsAndCo
         const auto & setting_name = setting.getName();
         size_t col = 0;
         res_columns[col++]->insert(setting_name);
-        res_columns[col++]->insert(setting.getValueString());
-        res_columns[col++]->insert(setting.getDefaultValueString());
+        res_columns[col++]->insert(setting.getValueString(/* show_secrets */ true));
+        res_columns[col++]->insert(setting.getDefaultValueString(/* show_secrets */ true));
         res_columns[col++]->insert(setting.isValueChanged());
         res_columns[col++]->insert(setting.getDescription());
         Field min;
@@ -3125,6 +3119,11 @@ Field MergeTreeSettings::stringToValueUtil(std::string_view name, const String &
 bool MergeTreeSettings::hasBuiltin(std::string_view name)
 {
     return MergeTreeSettingsImpl::hasBuiltin(name);
+}
+
+std::optional<SettingsTierType> MergeTreeSettings::tryGetTierOfBuiltin(std::string_view name)
+{
+    return MergeTreeSettingsImpl::tryGetTierOfBuiltin(name);
 }
 
 std::string_view MergeTreeSettings::resolveName(std::string_view name)

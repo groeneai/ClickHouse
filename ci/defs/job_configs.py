@@ -2,6 +2,7 @@ from praktika import Job
 from praktika.utils import Utils
 
 from ci.defs.defs import (
+    ASAN_IT_NUM_BATCHES,
     LLVM_ARTIFACTS_LIST,
     LLVM_FT_NUM_BATCHES,
     LLVM_FT_OLD_S3_DB_REPL_WASM_NUM_BATCHES,
@@ -111,6 +112,7 @@ common_ft_job_config = Job.Config(
             "./ci/jobs/scripts/server_cleanup.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
+            "./ci/praktika/cidb.py",
             "./tests/queries",
             "./tests/clickhouse-test",
             "./tests/config",
@@ -704,8 +706,11 @@ class JobConfigs:
     # subset as well. If test selection cannot be fetched, the job fails instead
     # of silently running a weaker unbatched fallback configuration.
     # The selection is computed from PR-local state (including failed tests
-    # from earlier jobs).
+    # from earlier jobs) that is not part of a repository digest. Reusing a
+    # cached result could therefore skip a different selection; keep these
+    # jobs uncached.
     selected_ft_job_config = common_ft_job_config.copy()
+    selected_ft_job_config.digest_config = None
     stateless_tests_selected_pr_jobs = selected_ft_job_config.parametrize(
         Job.ParamSet(
             parameter="amd_asan_ubsan, distributed plan, parallel, selected tests",
@@ -1191,7 +1196,8 @@ class JobConfigs:
             requires=[ArtifactNames.DEB_AMD_RELEASE],
         ),
     )
-    # why it's master only?
+    # Despite the name, only release_branches.py uses these.
+    # `ASAN_IT_NUM_BATCHES` explains the batch count; keep it in step with the flavor below.
     integration_test_asan_master_jobs = common_integration_test_job_config.parametrize(
         *[
             Job.ParamSet(
@@ -1199,7 +1205,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
             )
-            for total_batches in (4,)
+            for total_batches in (ASAN_IT_NUM_BATCHES,)
             for batch in range(1, total_batches + 1)
         ]
     )
@@ -1210,7 +1216,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
             )
-            for total_batches in (6,)
+            for total_batches in (ASAN_IT_NUM_BATCHES,)
             for batch in range(1, total_batches + 1)
         ],
         *[
@@ -1639,36 +1645,17 @@ class JobConfigs:
         requires=["Build (amd_release)", "Build (arm_release)"],
         post_hooks=["python3 ./ci/jobs/scripts/job_hooks/docker_clean_up_hook.py"],
     )
-    # Both fuzzers run against two builds. The release build is the wrong-result
-    # hunt: a sanitizer binary executes SQL 2-3x slower, so most of a 5h budget
-    # would buy sanitizer coverage instead of SQL coverage (measured: 47-80
-    # queries/s at 10 threads on arm_asan_ubsan). The arm_asan_ubsan build is kept
-    # as its own job for what only it can find - memory errors and UB reached
-    # through generated SQL.
-    # `-e SLACK_WEBHOOK_CORE_QA`: the job alerts on new findings (see
-    # ci/jobs/scripts/sqlancer_notify.py); without the secret it is a no-op.
     sqlancer_master_jobs = Job.Config(
         name=JobNames.SQLANCER,
         runs_on=[],  # from parametrize()
         command="./ci/jobs/sqlancer_job.sh",
         digest_config=Job.CacheDigestConfig(
-            include_paths=[
-                "./ci/jobs/sqlancer_job.sh",
-                "./ci/jobs/scripts/sqlancer_failures.py",
-                "./ci/jobs/scripts/sqlancer_notify.py",
-                "./ci/jobs/scripts/sqlancer_server_errors.sh",
-                "./ci/docker/sqlancer-test",
-            ],
+            include_paths=["./ci/jobs/sqlancer_job.sh", "./ci/docker/sqlancer-test"],
         ),
-        run_in_docker="clickhouse/sqlancer-test+-e SLACK_WEBHOOK_CORE_QA",
+        run_in_docker="clickhouse/sqlancer-test",
         # 5h sqlancer run (set in sqlancer_job.sh) plus server start/teardown.
         timeout=3600 * 5 + 1800,
     ).parametrize(
-        Job.ParamSet(
-            parameter="arm_release",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
-            requires=[ArtifactNames.CH_ARM_RELEASE],
-        ),
         Job.ParamSet(
             parameter="arm_asan_ubsan",
             runs_on=RunnerLabels.FUNC_TESTER_ARM,
@@ -1682,18 +1669,12 @@ class JobConfigs:
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/sqlancer_pp_job.sh",
-                "./ci/jobs/scripts/sqlancer_server_errors.sh",
                 "./ci/docker/sqlancer-test",
             ],
         ),
         run_in_docker="clickhouse/sqlancer-test",
         timeout=3600,
     ).parametrize(
-        Job.ParamSet(
-            parameter="arm_release",
-            runs_on=RunnerLabels.FUNC_TESTER_ARM,
-            requires=[ArtifactNames.CH_ARM_RELEASE],
-        ),
         Job.ParamSet(
             parameter="arm_asan_ubsan",
             runs_on=RunnerLabels.FUNC_TESTER_ARM,
@@ -1806,7 +1787,10 @@ class JobConfigs:
         result_name_for_cidb="Tests",
         digest_config=Job.CacheDigestConfig(
             include_paths=[
+                "./ci/defs/defs.py",
+                "./ci/defs/job_configs.py",
                 "./ci/jobs/parser_memory_check.py",
+                "./ci/workflows/pull_request.py",
                 "./utils/parser-memory-profiler/",
             ],
         ),
@@ -1848,7 +1832,15 @@ class JobConfigs:
     # Compares the PR's arm_release build profile (binary and per-object sizes,
     # per-symbol sizes, compile and link time down to individual functions and
     # template instantiations) against the latest master build, and posts a PR
-    # comment when the change is significant.
+    # comment when the change is significant. The data comes from the CI logs
+    # cluster: the PR side is uploaded by the arm_release build post-hook
+    # (build_profile_hook.py), the master side by master workflow builds.
+    # No digest_config, i.e. not cacheable: the job's output is a PR comment
+    # about one concrete commit (it embeds the head sha and links this run's
+    # report). Reusing a cached result would leave that comment describing an
+    # older commit of the PR - including a change that the head has already
+    # reverted - so the comparison is redone for every head. The job is cheap:
+    # it only queries the CI logs cluster.
     build_profile_diff_job = Job.Config(
         name=JobNames.BUILD_PROFILE_DIFF,
         runs_on=RunnerLabels.ARM_SMALL,
@@ -1858,9 +1850,6 @@ class JobConfigs:
         run_in_docker="clickhouse/stateless-test",
         requires=["Build (arm_release)"],
         command="python3 ./ci/jobs/build_profile_diff_job.py",
-        digest_config=Job.CacheDigestConfig(
-            include_paths=["./ci/jobs/build_profile_diff_job.py"],
-        ),
         timeout=1800,
         enable_gh_auth=True,
         # Run on a red head too. This job is the only writer of the
@@ -1919,6 +1908,7 @@ class JobConfigs:
                 integration_test_jobs_required + integration_test_jobs_non_required
             )
         ],
+        run_unless_cancelled=True,
         command="python3 ./ci/jobs/promql_compliance_job.py",
         post_hooks=[
             "python3 ./ci/jobs/scripts/job_hooks/promql_compliance_comment_hook.py",
@@ -1932,7 +1922,7 @@ class JobConfigs:
 
     sign_macos_binary_jobs = Job.Config(
         name=JobNames.SIGN_MACOS,
-        runs_on=RunnerLabels.STYLE_CHECK_AMD,
+        runs_on=RunnerLabels.RELEASE_RUNNER,
         command="python3 ./ci/jobs/sign_macos_binary.py --build-type {PARAMETER}",
         run_in_docker="clickhouse/utils+--network=host+root",
         timeout=3600,

@@ -103,6 +103,7 @@
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/SettingsEnums.h>
+#include <Core/SettingsSecrets.h>
 
 #include <IO/CompressionMethod.h>
 
@@ -522,6 +523,27 @@ static String httpRequestURLForLogging(const ContextPtr & context)
     return url.substr(0, url.find_first_of("?#"));
 }
 
+String formatQueryForLogging(const String & query, const Settings & settings)
+{
+    const char * pos = query.data();
+    const char * end = pos + query.size();
+    ParserQuery parser(end, settings[Setting::allow_settings_after_format_in_insert], settings[Setting::implicit_select]);
+    String parse_error;
+    const ASTPtr ast = tryParseQuery(
+        parser,
+        pos,
+        end,
+        parse_error,
+        /*hilite*/ false,
+        "",
+        /*allow_multi_statements*/ false,
+        settings[Setting::max_query_size],
+        settings[Setting::max_parser_depth],
+        settings[Setting::max_parser_backtracks],
+        /*skip_insignificant*/ true);
+    return ast ? ast->formatForLogging(settings[Setting::log_queries_cut_to_length]) : "";
+}
+
 QueryLogElement logQueryStart(
     const std::chrono::time_point<std::chrono::system_clock> & query_start_time,
     const ContextMutablePtr & context,
@@ -549,7 +571,7 @@ QueryLogElement logQueryStart(
     elem.current_database = context->getCurrentDatabase();
     elem.query = query_for_logging;
     if (query_ast && settings[Setting::log_formatted_queries])
-        elem.formatted_query = query_ast->formatWithSecretsOneLine();
+        elem.formatted_query = query_ast->formatForLogging();
     elem.normalized_query_hash = normalized_query_hash;
     elem.query_kind = query_ast ? query_ast->getQueryKind() : IAST::QueryKind::Select;
 
@@ -591,7 +613,7 @@ QueryLogElement logQueryStart(
             interpreter->extendQueryLogElem(elem, query_ast, context, query_database, query_table);
 
         if (settings[Setting::log_query_settings])
-            elem.query_settings = context->getSettingsRef().changedToMap();
+            elem.query_settings = context->getSettingsRef().changedToMap(/* show_secrets */ false);
 
         elem.log_comment = settings[Setting::log_comment];
         if (elem.log_comment.size() > settings[Setting::max_query_size])
@@ -837,7 +859,9 @@ static void logQueryFinishImpl(
             auto changes = settings.changes();
             for (const auto & change : changes)
             {
-                query_span->addAttribute(fmt::format("clickhouse.setting.{}", change.name), convertFieldToString(change.value));
+                String value = convertFieldToString(change.value);
+                CoreSettings::maskSettingValue(change.name, change.value, value);
+                query_span->addAttribute(fmt::format("clickhouse.setting.{}", change.name), value);
             }
         }
         query_span->finish(time);
@@ -998,7 +1022,7 @@ void logExceptionBeforeStart(
     {
         elem.query_kind = ast->getQueryKind();
         if (settings[Setting::log_formatted_queries])
-            elem.formatted_query = ast->formatWithSecretsOneLine();
+            elem.formatted_query = ast->formatForLogging();
     }
 
     addPrivilegesInfoToQueryLogElement(elem, context);
@@ -1023,7 +1047,7 @@ void logExceptionBeforeStart(
         elem.tid = txn->tid;
 
     if (settings[Setting::log_query_settings])
-        elem.query_settings = settings.changedToMap();
+        elem.query_settings = settings.changedToMap(/* show_secrets */ false);
 
     if (settings[Setting::calculate_text_stack_trace])
         elem.stack_trace = getExceptionStackTraceString(std::current_exception());
@@ -2234,12 +2258,6 @@ static BlockIO executeQueryImpl(
     if (query_span && query_span->trace_id != UUID{})
         LOG_TRACE(getLogger("executeQuery"), "Query span trace_id for opentelemetry log: {}", query_span->trace_id);
 
-    /// A trace started by sampling (`opentelemetry_start_trace_probability`) exists only in the thread-local context.
-    /// Write the sampled context back, so that everything that forwards `ClientInfo` to secondary queries (remote and distributed
-    /// queries, DDL entries) carries the trace even where the ambient context is not available.
-    if (query_span && query_span->isTraceEnabled() && context->getClientTraceContext().trace_id == UUID{})
-        context->setClientTraceContext(OpenTelemetry::CurrentContext());
-
     /// Used for logging query start time in system.query_log
     auto query_start_time = std::chrono::system_clock::now();
 
@@ -3110,7 +3128,10 @@ static BlockIO executeQueryImpl(
                     if (auto * create_interpreter = typeid_cast<InterpreterCreateQuery *>(interpreter.get()))
                     {
                         create_interpreter->setIsRestoreFromBackup(flags.distributed_backup_restore);
-                        create_interpreter->setInternal(internal);
+                        /// `InterpreterCreateQuery` uses `internal` to mean "initiated by the server itself, so all
+                        /// the restrictions for user queries (access checks among them) can be skipped". A query
+                        /// written by the user is never that, even when it is executed as a nested `internal` query.
+                        create_interpreter->setInternal(internal && !flags.user_initiated);
                     }
 
                     std::unique_ptr<OpenTelemetry::SpanHolder> span;

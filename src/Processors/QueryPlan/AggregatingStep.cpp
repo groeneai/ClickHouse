@@ -6,6 +6,7 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnNullable.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -69,6 +70,11 @@ namespace QueryPlanSerializationSetting
     extern const QueryPlanSerializationSettingsUInt64 adaptive_aggregator_freeze_threshold_bytes;
     extern const QueryPlanSerializationSettingsBool serialize_string_in_memory_with_zero_byte;
     extern const QueryPlanSerializationSettingsBool enable_packed_string_keys_in_aggregation;
+}
+
+namespace Setting
+{
+    extern const SettingsBool use_aggregation_memory_tracker;
 }
 
 namespace ErrorCodes
@@ -409,9 +415,13 @@ const char * AggregatingStep::adaptiveAggregatorRejectionReason(const QueryPipel
     if (params.only_merge)
         return "the step only merges";
 
-    /// TODO (nihalzp): Support the group-by limits and the overflow row.
-    if (params.max_rows_to_group_by != 0 || params.overflow_row)
-        return "group-by limits or the overflow row are set";
+
+    /// TODO (nihalzp): Support the break and any overflow modes and the overflow row.
+    if (params.max_rows_to_group_by != 0 && params.group_by_overflow_mode != OverflowMode::THROW)
+        return "a dropping group-by limit mode is set";
+
+    if (params.overflow_row)
+        return "the overflow row is set";
 
     if (params.keys_size < 1)
         return "the aggregation has no keys";
@@ -559,6 +569,10 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
             });
         }
 
+        /// The per-set results are spread over `max_threads` streams below, so split a small single-level
+        /// result of each set for that width as for an ordinary aggregation.
+        const size_t grouping_sets_output_streams = should_produce_results_in_order_of_bucket_number ? 1 : params.max_threads;
+
         pipeline.transform([&](OutputPortRawPtrs ports)
         {
             chassert(streams * grouping_sets_size == ports.size());
@@ -582,7 +596,8 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                             new_temporary_data_merge_threads,
                             should_produce_results_in_order_of_bucket_number,
                             skip_merging,
-                            nullptr);
+                            nullptr,
+                            grouping_sets_output_streams);
                         // For each input stream we have `grouping_sets_size` copies, so port index
                         // for transform #j should skip ports of first (j-1) streams.
                         connect(*ports[i + grouping_sets_size * j], aggregation_for_set->getInputs().front());
@@ -593,7 +608,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                 else
                 {
                     auto aggregation_for_set
-                        = std::make_shared<AggregatingTransform>(input_header, transform_params_for_set, dataflow_cache_updater);
+                        = std::make_shared<AggregatingTransform>(input_header, transform_params_for_set, dataflow_cache_updater, grouping_sets_output_streams);
                     connect(*ports[i], aggregation_for_set->getInputs().front());
                     ports[i] = &aggregation_for_set->getOutputs().front();
                     processors.push_back(aggregation_for_set);
@@ -686,6 +701,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     many_data,
                     counter++,
                     limit_hint,
+                    limit_hint_prefix_columns,
                     nullptr // `dataflow_cache_updater` will be passed to `MergingAggregatedBucketTransform` below
                 );
             });
@@ -737,6 +753,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     sort_description_for_merging, group_by_sort_description,
                     max_block_size, aggregation_in_order_max_block_bytes,
                     limit_hint,
+                    limit_hint_prefix_columns,
                     dataflow_cache_updater);
             });
 
@@ -853,7 +870,8 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     new_temporary_data_merge_threads,
                     should_produce_results_in_order_of_bucket_number,
                     skip_merging,
-                    dataflow_cache_updater);
+                    dataflow_cache_updater,
+                    streams_after_aggregation);
             });
 
         pipeline.resize(streams_after_aggregation, false, settings.min_outstreams_per_resize_after_split);
@@ -863,7 +881,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
     else
     {
         pipeline.addSimpleTransform([&](const SharedHeader & header)
-                                    { return std::make_shared<AggregatingTransform>(header, transform_params, dataflow_cache_updater); });
+                                    { return std::make_shared<AggregatingTransform>(header, transform_params, dataflow_cache_updater, streams_after_aggregation); });
 
         pipeline.resize(streams_after_aggregation);
 
@@ -1354,7 +1372,8 @@ QueryPlanStepPtr AggregatingStep::deserialize(Deserialization & ctx)
         ctx.settings[QueryPlanSerializationSetting::enable_packed_string_keys_in_aggregation],
         ctx.settings[QueryPlanSerializationSetting::enable_adaptive_aggregator],
         ctx.settings[QueryPlanSerializationSetting::adaptive_aggregator_freeze_threshold],
-        ctx.settings[QueryPlanSerializationSetting::adaptive_aggregator_freeze_threshold_bytes]};
+        ctx.settings[QueryPlanSerializationSetting::adaptive_aggregator_freeze_threshold_bytes],
+        ctx.context->getSettingsRef()[Setting::use_aggregation_memory_tracker]};
 
     auto aggregating_step = std::make_unique<AggregatingStep>(
         ctx.input_headers.front(),

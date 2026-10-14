@@ -10,6 +10,7 @@
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
+#include <Core/Block.h>
 #include <Core/ProtocolDefines.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -28,6 +29,7 @@
 #include <IO/WriteHelpers.h>
 #include <Interpreters/AsynchronousInsertQueue.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Storages/StorageProxy.h>
 #include <Interpreters/InternalTextLogsQueue.h>
 #include <Interpreters/Session.h>
 #include <Interpreters/Squashing.h>
@@ -53,6 +55,7 @@
 #include <Common/LockMemoryExceptionInThread.h>
 #include <Common/NetException.h>
 #include <Common/OpenSSLHelpers.h>
+#include <Common/quoteString.h>
 #include <Common/SettingSource.h>
 #include <Common/SettingsChanges.h>
 #include <Common/Stopwatch.h>
@@ -898,7 +901,7 @@ void TCPHandler::runImpl()
                             block,
                             getCompressionCodec(query_settings, query_state->compression),
                             client_tcp_protocol_version,
-                            getFormatSettings(query_state->query_context),
+                            getNativeWireFormatSettings(query_state->query_context),
                             !query_settings[Setting::low_cardinality_allow_in_native_format]);
                     });
 
@@ -1226,7 +1229,15 @@ bool TCPHandler::receivePacketsExpectQuery(std::shared_ptr<QueryState> & state)
 
         case Protocol::Client::Data:
         case Protocol::Client::Scalar:
-            processUnexpectedData();
+            /// The payload is deliberately left unread: nothing consumes it here (the connection
+            /// closes with no reply), and in interserver mode the connection is not authenticated
+            /// until the Query packet, so reading it would deserialize a peer-chosen type.
+            ///
+            /// Name that case for what it is: an unauthenticated peer, so that `runImpl` answers it
+            /// the way it answers every other interserver authentication failure.
+            if (is_interserver_mode && !is_interserver_authenticated)
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                    "Unexpected data packet received before interserver authentication");
             throw Exception(ErrorCodes::UNEXPECTED_PACKET_FROM_CLIENT, "Unexpected packet Data received from client");
 
         case Protocol::Client::Ping:
@@ -1308,7 +1319,7 @@ bool TCPHandler::receivePacketsExpectData(QueryState & state)
             {
                 bool empty_block = false;
                 if (state.skipping_data)
-                    empty_block = !processUnexpectedData();
+                    empty_block = !processUnexpectedData(state);
                 else
                     empty_block = !processData(state, packet_type == Protocol::Client::Scalar);
                 if (empty_block)
@@ -1740,7 +1751,8 @@ void TCPHandler::processTablesStatusRequest()
             continue;
 
         TableStatus status;
-        if (auto * replicated_table = dynamic_cast<StorageReplicatedMergeTree *>(table.get()))
+        /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
+        if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
         {
             status.is_replicated = true;
             status.absolute_delay = static_cast<UInt32>(replicated_table->getAbsoluteDelay());
@@ -1937,7 +1949,10 @@ bool TCPHandler::receiveProxyHeader()
     /// Only PROXYv1 is supported.
     /// Validation of protocol is not fully performed.
 
-    LimitReadBuffer limit_in(*in, {.read_no_more=107, .expect_eof=true}); /// Maximum length from the specs.
+    /// No `expect_eof`: except for the `UNKNOWN` health check below, the client sends its handshake
+    /// right after the header, so the connection does not end at the limit. An over-long header is
+    /// rejected anyway, by carrying no `\r\n` within these 107 bytes.
+    LimitReadBuffer limit_in(*in, {.read_no_more=107}); /// Maximum length from the specs.
 
     assertString("PROXY ", limit_in);
 
@@ -2061,6 +2076,16 @@ std::unique_ptr<Session> TCPHandler::makeSession()
 /// Applied before authentication to prevent unauthenticated clients
 /// from consuming excessive memory. See #52501.
 static constexpr size_t MAX_HELLO_STRING_SIZE = 64 * 1024;
+
+/** The externally granted roles are a serialized list of role names. Both the size of the list and
+  * the number of names in it come from the peer, and in interserver mode they are read before the
+  * secret hash of the query is checked, so bound them.
+  */
+static constexpr size_t MAX_EXTRA_ROLES_SIZE = 1024 * 1024;
+/// Only read on the interserver path, which is compiled out without SSL.
+[[maybe_unused]] static constexpr size_t MAX_EXTRA_ROLES = 65536;
+/// A role name is an identifier, and it is resized to its declared size before its value arrives.
+[[maybe_unused]] static constexpr size_t MAX_EXTRA_ROLE_NAME_SIZE = 64 * 1024;
 
 void TCPHandler::receiveHello()
 {
@@ -2557,7 +2582,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
     // TODO: check if having `is_interserver_mode` doesn't break interoperability with the CH-client.
     if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES)
     {
-        readStringBinary(received_extra_roles, *in);
+        readStringBinary(received_extra_roles, *in, MAX_EXTRA_ROLES_SIZE);
     }
 
     /// Interserver secret.
@@ -2672,7 +2697,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
             {
                 ReadBufferFromString buffer(received_extra_roles);
 
-                readVectorBinary(external_roles, buffer);
+                readVectorBinary(external_roles, buffer, MAX_EXTRA_ROLES, MAX_EXTRA_ROLE_NAME_SIZE);
                 LOG_DEBUG(log, "Parsed extra roles [{}]", fmt::join(external_roles, ", "));
             }
 
@@ -2743,7 +2768,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
                     block,
                     getCompressionCodec(query_settings, current_state->compression),
                     client_tcp_protocol_version,
-                    getFormatSettings(current_state->query_context),
+                    getNativeWireFormatSettings(current_state->query_context),
                     !query_settings[Setting::low_cardinality_allow_in_native_format]);
             });
     }
@@ -2819,7 +2844,7 @@ void TCPHandler::processUnexpectedQuery()
     UInt64 skip_uint_64 = 0;
     String skip_string;
 
-    readStringBinary(skip_string, *in);
+    readStringBinary(skip_string, *in, MAX_HELLO_STRING_SIZE);
 
     ClientInfo skip_client_info;
     if (client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_CLIENT_INFO)
@@ -2829,6 +2854,10 @@ void TCPHandler::processUnexpectedQuery()
     auto settings_format = (client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS) ? SettingsWriteFormat::STRINGS_WITH_FLAGS
                                                                                                       : SettingsWriteFormat::BINARY;
     skip_settings.read(*in, settings_format);
+
+    /// The same layout as in `processQuery`: the externally granted roles precede the interserver hash.
+    if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES)
+        readStringBinary(skip_string, *in, MAX_EXTRA_ROLES_SIZE);
 
     std::string skip_hash;
     bool interserver_secret = client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET;
@@ -2843,7 +2872,7 @@ void TCPHandler::processUnexpectedQuery()
     readStringBinary(skip_string, *in);
 
     if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS)
-        skip_settings.read(*in, settings_format);
+        std::ignore = readQueryParameters(*in);
 
     throw Exception(ErrorCodes::UNEXPECTED_PACKET_FROM_CLIENT, "Unexpected packet Query received from client");
 }
@@ -2922,6 +2951,22 @@ bool TCPHandler::processData(QueryState & state, bool scalar)
             state.query_context->addExternalTable(temporary_id.table_name, std::move(temporary_table));
         }
         auto metadata_snapshot = storage->getInMemoryMetadataPtr(state.query_context, false);
+
+        /// The block is self-describing and comes from the client, while the schema of an external table
+        /// is bound once, by its first block (see the branch above). Every block after that one must match
+        /// that schema: the columns are written to the table as a `Chunk`, which carries no types at all,
+        /// and `MemorySink::consume` labels them with the table header again. A block declaring other
+        /// types would therefore not be rejected anywhere, and its data would later be read as the type
+        /// the header names - a type confusion on data the client controls, not a data error.
+        if (resolved && !isCompatibleHeader(block, metadata_snapshot->getSampleBlock()))
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Structure of the block for external table {} does not match the structure of the table. "
+                "Received:\n{}\nExpected:\n{}",
+                backQuoteIfNeed(temporary_id.table_name),
+                block.dumpStructure(),
+                metadata_snapshot->getSampleBlock().dumpStructure());
+
         /// The data will be written directly to the table.
         QueryPipeline temporary_table_out(storage->write(ASTPtr(), metadata_snapshot, state.query_context, /*async_insert=*/false));
         PushingPipelineExecutor executor(temporary_table_out);
@@ -2944,7 +2989,7 @@ bool TCPHandler::processData(QueryState & state, bool scalar)
 }
 
 
-bool TCPHandler::processUnexpectedData()
+bool TCPHandler::processUnexpectedData(QueryState & state)
 {
     String skip_external_table_name;
     readStringBinary(skip_external_table_name, *in);
@@ -2955,7 +3000,8 @@ bool TCPHandler::processUnexpectedData()
     else
         maybe_compressed_in = in;
 
-    auto skip_block_in = std::make_shared<NativeReader>(*maybe_compressed_in, client_tcp_protocol_version);
+    auto skip_block_in = std::make_shared<NativeReader>(
+        *maybe_compressed_in, client_tcp_protocol_version, getNativeWireFormatSettings(state.query_context));
     bool empty_block = skip_block_in->read().empty();
     return !empty_block;
 }
@@ -2983,7 +3029,7 @@ void TCPHandler::initBlockInput(QueryState & state)
             *state.maybe_compressed_in,
             header,
             client_tcp_protocol_version,
-            getFormatSettings(state.query_context));
+            getNativeWireFormatSettings(state.query_context));
     }
 }
 
@@ -3043,7 +3089,7 @@ void TCPHandler::initBlockOutput(QueryState & state, const Block & block)
             *state.maybe_compressed_out,
             client_tcp_protocol_version,
             std::make_shared<const Block>(block.cloneEmpty()),
-            getFormatSettings(state.query_context),
+            getNativeWireFormatSettings(state.query_context),
             !query_settings[Setting::low_cardinality_allow_in_native_format]);
     }
 }
@@ -3067,7 +3113,7 @@ void TCPHandler::initLogsBlockOutput(
             *logs_buf,
             client_tcp_protocol_version,
             std::make_shared<const Block>(block.cloneEmpty()),
-            getFormatSettings(state.query_context),
+            getNativeWireFormatSettings(state.query_context),
             !query_settings[Setting::low_cardinality_allow_in_native_format]);
     }
 }
@@ -3086,7 +3132,7 @@ void TCPHandler::initProfileEventsBlockOutput(QueryState & state, const Block & 
 
         const Settings & query_settings = state.query_context->getSettingsRef();
         state.profile_events_block_out = std::make_unique<NativeWriter>(
-            *profile_events_buf, client_tcp_protocol_version, std::make_shared<const Block>(block.cloneEmpty()), getFormatSettings(state.query_context), !query_settings[Setting::low_cardinality_allow_in_native_format]);
+            *profile_events_buf, client_tcp_protocol_version, std::make_shared<const Block>(block.cloneEmpty()), getNativeWireFormatSettings(state.query_context), !query_settings[Setting::low_cardinality_allow_in_native_format]);
     }
 }
 

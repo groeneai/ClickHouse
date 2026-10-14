@@ -1,10 +1,14 @@
 #include <Storages/MergeTree/MergeTreeIndexBloomFilter.h>
 
+#include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/FieldAccurateComparison.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
@@ -13,6 +17,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/BloomFilterHash.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/PreparedSets.h>
 #include <Interpreters/Set.h>
@@ -28,6 +33,11 @@
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsBool validate_enum_literals_in_operators;
+}
 
 namespace ErrorCodes
 {
@@ -132,6 +142,24 @@ void MergeTreeIndexGranuleBloomFilter::fillingBloomFilter(BloomFilterPtr & bf, c
 
 namespace
 {
+
+/// True when the index column is an `Array` and the set holds an empty array. A set column that is
+/// not a `ColumnArray` cannot be inspected, so it counts as holding one.
+bool setHasEmptyArray(const DataTypePtr & index_type, const ColumnPtr & set_column, size_t row_size)
+{
+    if (!WhichDataType(index_type).isArray())
+        return false;
+
+    const auto * array_column = checkAndGetColumn<ColumnArray>(set_column.get());
+    if (!array_column)
+        return true;
+
+    for (size_t row = 0; row < row_size; ++row)
+        if (array_column->getSize(row) == 0)
+            return true;
+
+    return false;
+}
 
 ColumnWithTypeAndName getPreparedSetInfo(const ConstSetPtr & prepared_set)
 {
@@ -290,7 +318,10 @@ std::optional<MapIndexInfo> tryResolveMapInfoFromNode(const RPNBuilderTreeNode &
 
 MergeTreeIndexConditionBloomFilter::MergeTreeIndexConditionBloomFilter(
     const ActionsDAG::Node * predicate, ContextPtr context_, const Block & header_, size_t hash_functions_)
-    : WithContext(context_), header(header_), hash_functions(hash_functions_)
+    : WithContext(context_)
+    , header(header_)
+    , hash_functions(hash_functions_)
+    , validate_enum_literals_in_operators(context_->getSettingsRef()[Setting::validate_enum_literals_in_operators])
 {
     if (!predicate)
     {
@@ -548,14 +579,31 @@ bool MergeTreeIndexConditionBloomFilter::traverseFunction(const RPNBuilderTreeNo
     return false;
 }
 
+/// True when converting the constant to the element type yields the exact bytes the index holds, so
+/// hashing it is equivalent to the comparison. Floats are excluded: `-0.0` equals but hashes apart.
+static bool bloomFilterHashDomainMatches(const DataTypePtr & value_type, const DataTypePtr & nested_type)
+{
+    if (!value_type)
+        return false;
+
+    auto value = removeLowCardinalityAndNullable(value_type);
+    auto element = removeLowCardinalityAndNullable(nested_type);
+
+    if (isFloat(value) || isFloat(element))
+        return false;
+
+    return (isInteger(value) && isInteger(element)) || value->equals(*element);
+}
+
 bool MergeTreeIndexConditionBloomFilter::traverseTreeIn(
     const String & function_name,
-    const RPNBuilderTreeNode & key_node,
+    const RPNBuilderTreeNode & wrapped_key_node,
     const ConstSetPtr & prepared_set,
     const DataTypePtr & type,
     const ColumnPtr & column,
     RPNElement & out)
 {
+    const auto key_node = unwrapLosslessConversion(wrapped_key_node);
     auto key_node_column_name = key_node.getColumnName();
 
     if (header.has(key_node_column_name))
@@ -563,7 +611,21 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeIn(
         size_t row_size = column->size();
         size_t position = header.getPositionByName(key_node_column_name);
         const DataTypePtr & index_type = header.getByPosition(position).type;
+
+        /// A NULL of a set built for `toNullable(key)` does not cast to the key type and matches no stored value.
+        const auto * nullable_column = typeid_cast<const ColumnNullable *>(column.get());
+        if (nullable_column && !index_type->isNullable() && std::ranges::any_of(nullable_column->getNullMapData(), [](UInt8 is_null) { return is_null != 0; }))
+            return false;
+
         const auto & converted_column = castColumn(ColumnWithTypeAndName{column, type, ""}, index_type);
+
+        /// An `Array` index holds one hash per element, so a set array is looked up by its elements
+        /// and an empty one has no hash that can stand for it. Contribute no predicate at all: a
+        /// tuple `IN` shares this element, and a sibling component would re-enable the lookup.
+        if ((function_name == "in" || function_name == "globalIn")
+            && setHasEmptyArray(index_type, converted_column, row_size))
+            return false;
+
         out.predicate.emplace_back(std::make_pair(position, BloomFilterHash::hashWithColumn(index_type, converted_column, 0, row_size)));
 
         if (function_name == "in"  || function_name == "globalIn")
@@ -698,7 +760,35 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeIn(
         return true;
     }
 
-    return false;
+    /// `arrayJoin(col) IN (set)` needs a set element in the granule, same as `hasAny(col, set)`.
+    /// `notIn` is not derivable: a granule holding a set element still yields rows outside the set.
+    if (function_name != "in" && function_name != "globalIn")
+        return false;
+    if (!column)
+        return false;
+
+    auto array_join_argument = key_node.getArrayJoinArgument();
+    if (!array_join_argument)
+        return false;
+
+    auto array_column_name = array_join_argument->getColumnName();
+    if (!header.has(array_column_name))
+        return false;
+
+    size_t position = header.getPositionByName(array_column_name);
+    const auto * array_type = typeid_cast<const DataTypeArray *>(header.getByPosition(position).type.get());
+    if (!array_type)
+        return false;
+
+    const auto & array_nested_type = array_type->getNestedType();
+    if (!bloomFilterHashDomainMatches(type, array_nested_type))
+        return false;
+
+    const auto & converted_column = castColumn(ColumnWithTypeAndName{column, type, ""}, array_nested_type);
+    out.predicate.emplace_back(
+        std::make_pair(position, BloomFilterHash::hashWithColumn(array_nested_type, converted_column, 0, column->size())));
+    out.function = RPNElement::FUNCTION_HAS_ANY;
+    return true;
 }
 
 
@@ -893,13 +983,46 @@ static bool indexOfCanUseBloomFilter(const RPNBuilderTreeNode * parent)
 
 bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
     const String & function_name,
-    const RPNBuilderTreeNode & key_node,
+    const RPNBuilderTreeNode & wrapped_key_node,
     const DataTypePtr & value_type,
     const Field & value_field,
     RPNElement & out,
     const RPNBuilderTreeNode * parent)
 {
+    const auto key_node = unwrapLosslessConversion(wrapped_key_node);
     auto key_column_name = key_node.getColumnName();
+
+    /// `arrayJoin(col) = const` needs an element equal to the constant, same as `has(col, const)`.
+    /// `notEquals` is not derivable: a granule holding the constant still yields differing rows.
+    if (function_name == "equals")
+    {
+        if (auto array_join_argument = key_node.getArrayJoinArgument())
+        {
+            auto array_column_name = array_join_argument->getColumnName();
+            if (header.has(array_column_name))
+            {
+                size_t position = header.getPositionByName(array_column_name);
+                const auto * array_type = typeid_cast<const DataTypeArray *>(header.getByPosition(position).type.get());
+                if (array_type && bloomFilterHashDomainMatches(value_type, array_type->getNestedType()))
+                {
+                    const DataTypePtr actual_type = BloomFilter::getPrimitiveType(array_type->getNestedType());
+                    if (!validate_enum_literals_in_operators && isUnknownEnumElement(*actual_type, value_field))
+                    {
+                        out.function = RPNElement::ALWAYS_FALSE;
+                        return true;
+                    }
+
+                    auto converted_field = convertFieldToType(value_field, *actual_type, value_type.get());
+                    if (converted_field.isNull())
+                        return false;
+
+                    out.function = RPNElement::FUNCTION_HAS;
+                    out.predicate.emplace_back(std::make_pair(position, BloomFilterHash::hashWithField(actual_type.get(), converted_field)));
+                    return true;
+                }
+            }
+        }
+    }
 
     if (header.has(key_column_name))
     {
@@ -917,8 +1040,16 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
                 if (function_name == "has" || indexOfCanUseBloomFilter(parent))
                 {
                     out.function = RPNElement::FUNCTION_HAS;
-                    const DataTypePtr & nested_type = array_type->getNestedType();
-                    const DataTypePtr actual_type = BloomFilter::getPrimitiveType(nested_type);
+                    /// The function coerces the constant by the element type it sees, which may differ in `LowCardinality`.
+                    DataTypePtr nested_type = array_type->getNestedType();
+
+                    if (const auto * wrapped_dag_node = wrapped_key_node.getDAGNode())
+                    {
+                        if (const auto * wrapped_array_type = typeid_cast<const DataTypeArray *>(wrapped_dag_node->result_type.get()))
+                            nested_type = wrapped_array_type->getNestedType();
+                    }
+
+                    const DataTypePtr actual_type = BloomFilter::getPrimitiveType(array_type->getNestedType());
                     Field converted_field = convertConstantForArrayIndexFunction(value_field, value_type, nested_type, actual_type);
                     if (converted_field.isNull())
                         return false;
@@ -963,6 +1094,41 @@ bool MergeTreeIndexConditionBloomFilter::traverseTreeEquals(
 
             out.function = function_name == "equals" ? RPNElement::FUNCTION_EQUALS : RPNElement::FUNCTION_NOT_EQUALS;
             const DataTypePtr actual_type = BloomFilter::getPrimitiveType(index_type);
+
+            /// `String`/`FixedString` equality compares zero-padded, so a constant of M bytes matches
+            /// the whole family `value` + trailing '\0'*, while the index holds one hash per exact
+            /// stored value. The index is sound only where that family collapses to a single indexed
+            /// value: a `FixedString(N)` index with `N >= M` pads the constant into the one stored
+            /// form, while a `String` index, or a narrower `FixedString`, leaves the family unbounded
+            /// because `convertFieldToType` pads but never truncates.
+            /// The constant type is unwrapped here because `tryGetConstant` peels only an outer
+            /// `Nullable`. `Variant` and `Dynamic` keep their declared wrapper while handing out the
+            /// nested padded value, so an active `FixedString` alternative is indistinguishable from
+            /// a `String` one and both must be treated as possibly padded.
+            if (isStringOrFixedString(actual_type) && value_field.getType() == Field::Types::String)
+            {
+                const WhichDataType which_constant(removeLowCardinalityAndNullable(value_type));
+                const bool constant_may_be_fixed_string
+                    = which_constant.isFixedString() || which_constant.isVariant() || which_constant.isDynamic();
+                const size_t constant_bytes = value_field.safeGet<String>().size();
+                const auto * fixed_index_type = typeid_cast<const DataTypeFixedString *>(actual_type.get());
+
+                if (constant_may_be_fixed_string && !fixed_index_type)
+                    return false;
+
+                if (fixed_index_type && fixed_index_type->getN() < constant_bytes)
+                    return false;
+            }
+
+            /// With validation off, `equals`/`notEquals` against a name the enum lacks fold to a constant
+            /// for every row, so the conversion below must not throw; `KeyCondition` folds the same way.
+            if ((function_name == "equals" || function_name == "notEquals")
+                && !validate_enum_literals_in_operators && isUnknownEnumElement(*actual_type, value_field))
+            {
+                out.function = function_name == "equals" ? RPNElement::ALWAYS_FALSE : RPNElement::ALWAYS_TRUE;
+                return true;
+            }
+
             auto converted_field = convertFieldToType(value_field, *actual_type, value_type.get());
             if (converted_field.isNull())
                 return false;

@@ -179,15 +179,16 @@ ObjectStoragePtr StorageS3Configuration::createObjectStorage(ContextPtr context,
         url, *s3_settings, context, /* for_disk_s3 */ false, /*opt_disk_name*/ {}, /*refresh_credentials_callback*/ std::nullopt,
         is_loading_from_existing_metadata, force_anonymous_load_fallback);
 
-    auto client_refresher = [refresh_credentials_callback, this, context_ = Context::createCopy(context)] () -> std::unique_ptr<S3::Client>
+    S3ObjectStorage::S3CredentialsRefreshCallback client_refresher;
+    if (refresh_credentials_callback)
     {
-        if (!refresh_credentials_callback)
-            return nullptr;
-        auto new_client = getClient(
-            url, *s3_settings, context_, /* for_disk_s3 */ false, /*opt_disk_name*/ {}, refresh_credentials_callback,
-            is_loading_from_existing_metadata, force_anonymous_load_fallback);
-        return new_client;
-    };
+        client_refresher = [refresh_credentials_callback, this, context_ = Context::createCopy(context)] () -> std::unique_ptr<S3::Client>
+        {
+            return getClient(
+                url, *s3_settings, context_, /* for_disk_s3 */ false, /*opt_disk_name*/ {}, refresh_credentials_callback,
+                is_loading_from_existing_metadata, force_anonymous_load_fallback);
+        };
+    }
     return std::make_shared<S3ObjectStorage>(
         std::move(client),
         std::make_unique<S3Settings>(*s3_settings),
@@ -270,6 +271,7 @@ void S3StorageParsedArguments::fromNamedCollection(const NamedCollection & colle
         }
 
         partition_strategy_type = partition_strategy_type_opt.value();
+        partition_strategy_was_set = true;
     }
 
     if (collection.has("partition_columns_in_data_file"))
@@ -802,6 +804,7 @@ void S3StorageParsedArguments::fromAST(ASTs & args, ContextPtr context, bool wit
         }
 
         partition_strategy_type = partition_strategy_type_opt.value();
+        partition_strategy_was_set = true;
     }
 
     if (auto partition_columns_in_data_file_value = getFromPositionOrKeyValue<bool>("partition_columns_in_data_file", args, engine_args_to_idx, key_value_args);

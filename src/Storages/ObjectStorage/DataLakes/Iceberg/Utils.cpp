@@ -42,7 +42,9 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Disks/IStoragePolicy.h>
 #include <Functions/FunctionFactory.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Interpreters/sortBlock.h>
+#include <Poco/String.h>
 
 #if USE_AVRO
 
@@ -557,6 +559,22 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     return json.extract<Poco::JSON::Object::Ptr>();
 }
 
+/// Iceberg stores a decimal as its unscaled value in two's-complement big-endian form, in the
+/// minimum number of bytes that can hold every value of the declared precision. One bit of that
+/// space is taken by the sign, hence `8 * bytes - 1`.
+static size_t icebergDecimalRequiredBytes(UInt32 precision)
+{
+    UInt256 max_value = 1;
+    for (UInt32 i = 0; i < precision; ++i)
+        max_value *= 10;
+    max_value -= 1;
+
+    size_t bytes = 1;
+    while (bytes < sizeof(UInt256) && (max_value >> (8 * bytes - 1)) != 0)
+        ++bytes;
+    return bytes;
+}
+
 /// Returns type and required
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter)
 {
@@ -584,6 +602,11 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             return {"string", true};
         case TypeIndex::UUID:
             return {"uuid", true};
+        case TypeIndex::Decimal32:
+        case TypeIndex::Decimal64:
+        case TypeIndex::Decimal128:
+        case TypeIndex::Decimal256:
+            return {fmt::format("decimal({}, {})", getDecimalPrecision(*type), getDecimalScale(*type)), true};
         case TypeIndex::Tuple:
         {
             auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);
@@ -653,7 +676,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
     }
 }
 
-Poco::Dynamic::Var getAvroType(DataTypePtr type)
+Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
 {
     switch (type->getTypeId())
     {
@@ -689,6 +712,25 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type)
         case TypeIndex::String:
         case TypeIndex::UUID:
             return "string";
+        case TypeIndex::Decimal32:
+        case TypeIndex::Decimal64:
+        case TypeIndex::Decimal128:
+        case TypeIndex::Decimal256:
+        {
+            const UInt32 precision = getDecimalPrecision(*type);
+            const UInt32 scale = getDecimalScale(*type);
+
+            Poco::JSON::Object::Ptr decimal_type = new Poco::JSON::Object;
+            decimal_type->set("type", "fixed");
+            decimal_type->set("size", icebergDecimalRequiredBytes(precision));
+            /// `fixed` is a named Avro type, so the name must be unique within the manifest schema:
+            /// two partition fields of the same decimal shape must not both define `decimal_P_S`.
+            decimal_type->set("name", fmt::format("decimal_{}_{}_{}", precision, scale, field_id));
+            decimal_type->set("logicalType", "decimal");
+            decimal_type->set("precision", precision);
+            decimal_type->set("scale", scale);
+            return decimal_type;
+        }
         case TypeIndex::Nullable:
         {
             /// Iceberg manifest partition fields backed by ClickHouse `Nullable(T)`
@@ -697,7 +739,7 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type)
             auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
             Poco::JSON::Array::Ptr union_array = new Poco::JSON::Array;
             union_array->add("null");
-            union_array->add(getAvroType(type_nullable->getNestedType()));
+            union_array->add(getAvroType(type_nullable->getNestedType(), field_id));
             return union_array;
         }
         default:
@@ -1478,7 +1520,22 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name);
+            std::optional<TransformAndArgument> clickhouse_transform_name;
+            try
+            {
+                clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                    throw;
+            }
+            if (!clickhouse_transform_name.has_value())
+            {
+                /// An unknown or malformed transform is not a reason to reject the table: an Iceberg
+                /// sort order is only an optimization hint, so drop it and read/write the table as unsorted.
+                return KeyDescription{};
+            }
             /// Quote the column name so identifiers with special characters (e.g. `@timestamp`)
             /// produce a parseable ORDER BY clause.
             auto quoted_column_name = backQuoteIfNeed(column_name);
@@ -1568,9 +1625,47 @@ void forEachAvroEntry(
     auto reader_base = std::make_unique<avro::DataFileReaderBase>(std::move(input_stream), MAX_AVRO_SCHEMA_DEPTH);
     avro::DataFileReader<avro::GenericDatum> reader(std::move(reader_base));
 
+    if (reader.readerSchema().root()->type() != avro::AVRO_RECORD)
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Avro file {} has root schema type {}, but Iceberg manifest-list entries must be records",
+            filename,
+            static_cast<int>(reader.readerSchema().root()->type()));
+
     avro::GenericDatum datum(reader.readerSchema());
     while (reader.read(datum))
         callback(datum);
+}
+
+PartitionColumnValues getIdentityPartitionColumnValues(
+    const ProcessedManifestFileEntry & manifest_file_entry, const IcebergSchemaProcessor & schema_processor)
+{
+    const auto & partition_key_value = manifest_file_entry.parsed_entry->partition_key_value;
+    if (partition_key_value.empty())
+        return {};
+
+    PartitionColumnValues result;
+    for (const auto & partition_field : *manifest_file_entry.common_partition_specification)
+    {
+        if (Poco::toLower(partition_field.transform_name) != "identity")
+            continue;
+
+        if (partition_field.tuple_index < 0 || static_cast<size_t>(partition_field.tuple_index) >= partition_key_value.size())
+            continue;
+
+        const auto name_and_type
+            = schema_processor.tryGetFieldCharacteristics(manifest_file_entry.resolved_schema_id, partition_field.source_id);
+        if (!name_and_type.has_value())
+            continue;
+
+        Field value = convertFieldToTypeOrThrow(partition_key_value[partition_field.tuple_index], *name_and_type->type);
+        if (value.isNull())
+            continue;
+
+        result.emplace_back(name_and_type->name, std::move(value));
+    }
+
+    return result;
 }
 
 }

@@ -491,6 +491,15 @@ public:
         bool date_time_overflow_behavior_ignore_);
 
 private:
+    /// Whether any atom reads a `Nullable` key column whose analysed range may hold a NULL value.
+    /// A NULL satisfies neither a comparison nor its negation, which the two-valued range algebra of
+    /// `checkInHyperrectangle` cannot express, so it costs the analysis its `can_be_false` claim.
+    bool mayReadNullKeyValue(const Hyperrectangle & hyperrectangle, const DataTypes & key_types) const;
+    bool mayReadNullKeyValue(
+        const std::vector<int> & key_col_to_sparse_pos,
+        const Hyperrectangle & sparse_hyperrectangle,
+        const DataTypes & sparse_key_types) const;
+
     /// Information used when building a KeyCondition out of ActionsDAG.
     struct BuildInfo
     {
@@ -680,6 +689,8 @@ private:
     /// Holds the result of (setting.date_time_overflow_behavior == DateTimeOverflowBehavior::Ignore)
     /// Used to check toDateTime monotonicity.
     bool date_time_overflow_behavior_ignore;
+    /// Consulted only while extracting atoms, so the private copying constructor leaves it unset.
+    bool validate_enum_literals_in_operators = true;
 
     /// Holds whether the key columns are sorted in reverse (ORDER BY ... DESC) or not.
     KeyOrder key_order;

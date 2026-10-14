@@ -40,11 +40,13 @@
 #include <Columns/validateColumnType.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
+#include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Interpreters/misc.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/grouping.h>
 #include <Storages/StorageJoin.h>
+#include <Storages/StorageProxy.h>
 
 #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
@@ -81,7 +83,6 @@ namespace Setting
     extern const SettingsBool enable_function_early_short_circuit;
     extern const SettingsShortCircuitFunctionEvaluation short_circuit_function_evaluation;
     extern const SettingsBool execute_exists_as_scalar_subquery;
-    extern const SettingsBool format_display_secrets_in_show_and_select;
     extern const SettingsBool transform_null_in;
     extern const SettingsBool force_grouping_standard_compatibility;
     extern const SettingsBool validate_enum_literals_in_operators;
@@ -1310,7 +1311,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
                         scope.scope_node->formatASTForErrorMessage());
 
                 auto & table_node_typed = table_node->as<TableNode &>();
-                if (!std::dynamic_pointer_cast<StorageJoin>(table_node_typed.getStorage()))
+                if (!castStorage<StorageJoin>(table_node_typed.getStorage(), DeferredTable::Load))
                     throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                         "Function {} table '{}' should have engine StorageJoin. In scope {}",
                         function_name,
@@ -1954,7 +1955,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         allow_niladic_functions);
 
     /// Mask arguments if needed
-    if (!scope.context->getSettingsRef()[Setting::format_display_secrets_in_show_and_select])
+    if (!canDisplaySecrets(scope.context))
     {
         if (FunctionSecretArgumentsFinder::Result secret_arguments = FunctionSecretArgumentsFinderTreeNode(*function_node_ptr).getResult(); secret_arguments.hasSecrets())
         {
@@ -2141,8 +2142,9 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         }
         else
         {
-            /// Replace storage with values storage of insertion block
-            if (StoragePtr storage = scope.context->getViewSource())
+            /// Replace storage with values storage of insertion block.
+            /// The inner query of an ordinary view referenced by the view query reads the table itself.
+            if (StoragePtr storage = scope.context->getViewSource(); storage && !scope.context->isViewInnerQuery())
             {
                 QueryTreeNodePtr table_expression = in_second_argument;
 

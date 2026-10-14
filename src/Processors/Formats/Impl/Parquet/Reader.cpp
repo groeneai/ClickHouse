@@ -432,16 +432,25 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// i.e. the very same raw name `geo_meta` already carries. Translating them to the query-side
     /// name (as an earlier version of this code did) breaks the match against
     /// `primitive_columns[i].name` for any bbox sub-column that was itself renamed.
-    std::unordered_map<String, String> clickhouse_to_parquet_name;
-    const auto * query_side_column_mapper = format_filter_info->current_schema_column_mapper
-        ? format_filter_info->current_schema_column_mapper.get()
-        : format_filter_info->column_mapper.get();
-    if (query_side_column_mapper && format_filter_info->column_mapper)
-        clickhouse_to_parquet_name =
-            query_side_column_mapper->makeMapping(format_filter_info->column_mapper->getFieldIdToClickHouseName()).first;
+    std::optional<std::unordered_map<String, String>> clickhouse_to_parquet_name;
+    auto get_clickhouse_to_parquet_name = [&]() -> const std::unordered_map<String, String> &
+    {
+        if (!clickhouse_to_parquet_name)
+        {
+            clickhouse_to_parquet_name.emplace();
+            const auto * query_side_column_mapper = format_filter_info->current_schema_column_mapper
+                ? format_filter_info->current_schema_column_mapper.get()
+                : format_filter_info->column_mapper.get();
+            if (query_side_column_mapper && format_filter_info->column_mapper)
+                *clickhouse_to_parquet_name
+                    = query_side_column_mapper->makeMapping(format_filter_info->column_mapper->getFieldIdToClickHouseName()).first;
+        }
+        return *clickhouse_to_parquet_name;
+    };
     auto resolve_geo_meta = [&](const String & ch_name) -> std::unordered_map<String, DB::GeoColumnMetadata>::const_iterator
     {
-        if (auto it = clickhouse_to_parquet_name.find(ch_name); it != clickhouse_to_parquet_name.end())
+        const auto & mapping = get_clickhouse_to_parquet_name();
+        if (auto it = mapping.find(ch_name); it != mapping.end())
             return geo_meta->find(it->second);
         return geo_meta->find(ch_name);
     };
@@ -453,7 +462,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// pruning.
     auto to_raw_geometry_name = [&](const String & ch_name) -> String
     {
-        if (auto it = clickhouse_to_parquet_name.find(ch_name); it != clickhouse_to_parquet_name.end())
+        const auto & mapping = get_clickhouse_to_parquet_name();
+        if (auto it = mapping.find(ch_name); it != mapping.end())
             return it->second;
         return ch_name;
     };
@@ -2230,10 +2240,6 @@ void Reader::decodeOffsetIndex(ColumnChunk & column, const RowGroup & row_group)
         });
     int64_t num_rows = row_group.meta->num_rows;
 
-    /// A column chunk covers all rows of its row group, so the first page starts at row 0.
-    if (locations.front().first_row_index != 0)
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Invalid offset index: first page starts at row {}, expected 0", locations.front().first_row_index);
-
     int64_t prev_offset = meta.data_page_offset;
     int64_t prev_row_index = -1;
     for (const auto & loc : locations)
@@ -2605,7 +2611,7 @@ void Reader::skipToRowOrNextPage(std::optional<size_t> row_idx, ColumnChunk & co
         auto data = prefetcher.getRangeData(page_info.prefetch);
         const char * ptr = data.data();
         if (!initializeDataPage(ptr, ptr + data.size(), first_row_idx, page_info.end_row_idx, *row_idx, column, column_info))
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Page doesn't contain requested row");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Page doesn't contain requested row");
         found_page = true;
     }
 

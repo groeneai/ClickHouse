@@ -30,6 +30,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ProcessList.h>
+#include <Interpreters/castColumn.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
@@ -95,6 +96,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+namespace FailPoints
+{
+extern const char object_storage_source_pause_before_virtual_columns[];
+}
+
 namespace ErrorCodes
 {
     extern const int CANNOT_COMPILE_REGEXP;
@@ -203,6 +209,7 @@ namespace Setting
     extern const SettingsUInt64 s3_path_filter_limit;
     extern const SettingsBool use_parquet_metadata_cache;
     extern const SettingsBool s3_validate_etag_on_read;
+    extern const SettingsBool azure_validate_etag_on_read;
 }
 
 static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
@@ -240,6 +247,70 @@ static bool hasAttachedDeletes(const ObjectInfo & object_info)
 #endif
     return object_info.data_lake_metadata && object_info.data_lake_metadata->excluded_rows
         && object_info.data_lake_metadata->excluded_rows->size() > 0;
+}
+
+static bool readsIdentityPartitionColumn(
+    const ActionsDAG & dag, const std::vector<std::pair<String, Field>> & identity_partition_columns)
+{
+    if (identity_partition_columns.empty())
+        return false;
+
+    for (const auto & required : dag.getRequiredColumns())
+        for (const auto & [name, _] : identity_partition_columns)
+            if (name == required.name)
+                return true;
+    return false;
+}
+
+static ActionsDAG substituteIdentityPartitionColumns(
+    const ActionsDAG & dag, const std::vector<std::pair<String, Field>> & identity_partition_columns)
+{
+    std::unordered_map<std::string_view, const Field *> values_by_name;
+    for (const auto & [name, value] : identity_partition_columns)
+        values_by_name.emplace(name, &value);
+
+    ActionsDAG substitution;
+    for (const auto & required : dag.getRequiredColumns())
+    {
+        auto it = values_by_name.find(required.name);
+        if (it == values_by_name.end())
+            continue;
+
+        const auto & constant
+            = substitution.addColumn(required.type->createColumnConst(0, *it->second), required.type, required.name);
+        substitution.getOutputs().push_back(&substitution.materializeNode(constant));
+    }
+
+    return ActionsDAG::merge(std::move(substitution), dag.clone());
+}
+
+static std::optional<ActionsDAG> buildIdentityPartitionColumnsDag(
+    const Block & header, const std::vector<std::pair<String, Field>> & identity_partition_columns)
+{
+    std::unordered_map<std::string_view, const Field *> values_by_name;
+    for (const auto & [name, value] : identity_partition_columns)
+        if (header.has(name))
+            values_by_name.emplace(name, &value);
+
+    if (values_by_name.empty())
+        return {};
+
+    ActionsDAG dag;
+    auto & outputs = dag.getOutputs();
+    for (const auto & column : header)
+    {
+        const auto & input = dag.addInput(column.name, column.type);
+        auto it = values_by_name.find(column.name);
+        if (it == values_by_name.end())
+        {
+            outputs.push_back(&input);
+            continue;
+        }
+
+        const auto & constant = dag.addColumn(column.type->createColumnConst(1, *it->second), column.type, column.name);
+        outputs.push_back(&dag.materializeNode(constant));
+    }
+    return dag;
 }
 
 StorageObjectStorageSource::StorageObjectStorageSource(
@@ -601,6 +672,8 @@ Chunk StorageObjectStorageSource::generate()
             else if (object_metadata->is_size_known)
                 object_size = object_metadata->size_bytes;
 
+            FailPointInjection::pauseFailPoint(FailPoints::object_storage_source_pause_before_virtual_columns);
+
             VirtualColumnUtils::addRequestedFileLikeStorageVirtualsToChunk(
                 chunk,
                 read_from_format_info.requested_virtual_columns,
@@ -684,7 +757,7 @@ Chunk StorageObjectStorageSource::generate()
             if (chunk_size && chunk.hasColumns())
             {
                 /// Old delta lake code which needs to be deprecated in favour of DeltaLakeMetadataDeltaKernel.
-                if (dynamic_cast<const DeltaLakeMetadata *>(configuration->getExternalMetadata()))
+                if (std::dynamic_pointer_cast<const DeltaLakeMetadata>(configuration->getExternalMetadata()))
                 {
                     /// This is an awful temporary crutch,
                     /// which will be removed once DeltaKernel is used by default for DeltaLake.
@@ -722,6 +795,11 @@ Chunk StorageObjectStorageSource::generate()
 
                                     const auto column_pos = read_from_format_info.source_header.getPositionByName(name_and_type.name);
                                     auto partition_column = name_and_type.type->createColumnConst(chunk.getNumRows(), value)->convertToFullColumnIfConst();
+                                    /// The `_delta_log` type differs from the declared one when the columns were
+                                    /// specified rather than inferred, and the block follows the declared schema.
+                                    const auto & declared_type = read_from_format_info.source_header.getByPosition(column_pos).type;
+                                    if (!name_and_type.type->equals(*declared_type))
+                                        partition_column = castColumn({partition_column, name_and_type.type, name_and_type.name}, declared_type);
                                     /// This column is filled with default value now, remove it.
                                     chunk.erase(column_pos);
                                     /// Add correct values.
@@ -816,7 +894,7 @@ Chunk StorageObjectStorageSource::generate()
         }
 
         if (reader.getInputFormat() && read_context->getSettingsRef()[Setting::use_cache_for_count_from_files]
-            && !format_filter_info->filter_actions_dag
+            && !format_filter_info->hasFilter()
             && !hasAttachedDeletes(*reader.getObjectInfo())
             && !reader.getObjectInfo()->rows_to_read)
             addNumRowsToCache(*reader.getObjectInfo(), total_rows_in_file);
@@ -965,9 +1043,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         break;
     }
 
+    std::unique_ptr<ReadBuffer> read_buf; /// Destroyed last: `builder` and `source` hold the input format reading it.
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
-    std::unique_ptr<ReadBuffer> read_buf;
 
     auto try_get_num_rows_from_cache = [&]() -> std::optional<size_t>
     {
@@ -1069,6 +1147,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             initial_header = sample_header;
             schema_changed = true;
         }
+        std::vector<std::pair<String, Field>> identity_partition_columns;
+#if USE_AVRO
+        if (const auto * iceberg_info = dynamic_cast<const IcebergDataObjectInfo *>(object_info.get()))
+            identity_partition_columns = iceberg_info->info.identity_partition_columns;
+#endif
+
         /// Save stripped filters if we need to apply them as fallback FilterTransforms
         /// later in the pipeline when the file format doesn't support PREWHERE.
         FilterDAGInfoPtr stripped_row_level_filter;
@@ -1094,6 +1178,37 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     stripped_row_level_filter = format_filter_info->row_level_filter;
                 if (format_filter_info->prewhere_info)
                     stripped_prewhere_info = format_filter_info->prewhere_info;
+            }
+
+            auto row_level_filter = format_filter_info->row_level_filter;
+            auto prewhere_info = format_filter_info->prewhere_info;
+            bool filters_substituted = false;
+            /// A filter evaluated inside the reader must see the identity-partitioned columns of this
+            /// data file as the manifest defines them, because the file itself need not store them.
+            if (format_supports_prewhere && !identity_partition_columns.empty()
+                && (!schema_changed || configuration->getSchemaTransformer(context_, object_info) == nullptr))
+            {
+                if (row_level_filter && readsIdentityPartitionColumn(row_level_filter->actions, identity_partition_columns))
+                {
+                    auto substituted = std::make_shared<FilterDAGInfo>();
+                    substituted->actions
+                        = substituteIdentityPartitionColumns(row_level_filter->actions, identity_partition_columns);
+                    substituted->column_name = row_level_filter->column_name;
+                    substituted->do_remove_column = row_level_filter->do_remove_column;
+                    row_level_filter = std::move(substituted);
+                    filters_substituted = true;
+                }
+                if (prewhere_info && readsIdentityPartitionColumn(prewhere_info->prewhere_actions, identity_partition_columns))
+                {
+                    auto substituted = std::make_shared<PrewhereInfo>();
+                    substituted->prewhere_actions
+                        = substituteIdentityPartitionColumns(prewhere_info->prewhere_actions, identity_partition_columns);
+                    substituted->prewhere_column_name = prewhere_info->prewhere_column_name;
+                    substituted->remove_prewhere_column = prewhere_info->remove_prewhere_column;
+                    substituted->need_filter = prewhere_info->need_filter;
+                    prewhere_info = std::move(substituted);
+                    filters_substituted = true;
+                }
             }
 
             if (schema_changed)
@@ -1124,8 +1239,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     auto result = std::make_shared<FormatFilterInfo>(
                         format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
                         mapper,
-                        keep_in_reader ? format_filter_info->row_level_filter : nullptr,
-                        keep_in_reader ? format_filter_info->prewhere_info : nullptr);
+                        keep_in_reader ? row_level_filter : nullptr,
+                        keep_in_reader ? prewhere_info : nullptr);
                     /// `mapper` is scoped to the schema this specific file was written under, so it
                     /// maps field_id -> the column name *that file* used. Keep the current/query-side
                     /// mapper around too (see `current_schema_column_mapper` doc comment) for readers
@@ -1142,6 +1257,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     format_filter_info->context.lock(),
                     format_filter_info->column_mapper,
                     nullptr, nullptr);
+
+            if (filters_substituted)
+                return std::make_shared<FormatFilterInfo>(
+                    format_filter_info->filter_actions_dag,
+                    format_filter_info->context.lock(),
+                    format_filter_info->column_mapper,
+                    row_level_filter, prewhere_info);
 
             return format_filter_info;
         }();
@@ -1251,6 +1373,18 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             input_format->needOnlyCount();
 
         builder.init(Pipe(input_format));
+
+        if (!identity_partition_columns.empty())
+        {
+            if (auto dag = buildIdentityPartitionColumnsDag(builder.getHeader(), identity_partition_columns))
+            {
+                auto actions = std::make_shared<ExpressionActions>(std::move(*dag));
+                builder.addSimpleTransform([&](const SharedHeader & header)
+                {
+                    return std::make_shared<ExpressionTransform>(header, actions);
+                });
+            }
+        }
 
         configuration->addDeleteTransformers(object_info, builder, format_settings, parser_shared_resources, context_);
 
@@ -1446,16 +1580,24 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// 2. object etag suggests a cache key in case we use filesystem cache
     /// 3. object etag as a cache key for parquet metadata caching
     /// 4. object etag to detect a concurrent in-place overwrite during the read
+    /// Whether the read is pinned to the generation of the object seen at listing time. Each backend
+    /// that supports it has its own setting, because they are documented per backend and a user may
+    /// want to opt out of the check for one store but not the other.
+    bool validate_etag_on_read = false;
+    if (object_storage->getType() == ObjectStorageType::S3)
+        validate_etag_on_read = settings[Setting::s3_validate_etag_on_read];
+    else if (object_storage->getType() == ObjectStorageType::Azure)
+        validate_etag_on_read = settings[Setting::azure_validate_etag_on_read];
+
     if (!object_info.metadata)
     {
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
-    else if (!object_info.metadata->is_fetched && settings[Setting::s3_validate_etag_on_read]
-             && object_storage->getType() == ObjectStorageType::S3)
+    else if (!object_info.metadata->is_fetched && validate_etag_on_read)
     {
-        /// Refresh the s3Cluster skip_object_metadata placeholder to obtain its size + ETag for read-time
-        /// validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch that
-        /// merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
+        /// Refresh the cluster function's skip_object_metadata placeholder to obtain its size + ETag for
+        /// read-time validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch
+        /// that merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
 
@@ -1521,13 +1663,18 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// filename to `readWithDistributedCache` (it ends up in `getFileName()` and in
     /// `system.distributed_cache_log.filename`). Use the object path so the DC log
     /// shows a useful name rather than an empty string.
-    const auto stored_object_size = is_size_known ? object_size : StoredObject::UnknownSize;
+    /// The size is used by the object storage as the right bound of the read, so it must come from a
+    /// real listing or HEAD: the skip_object_metadata placeholder is default-constructed, and its
+    /// `size_bytes == 0` would otherwise read every non-empty object as empty.
+    const auto stored_object_size = is_size_known && object_info.metadata->is_fetched
+        ? object_size
+        : StoredObject::UnknownSize;
     StoredObject stored_object(object_info.getPath(), object_info.getPath(), stored_object_size, object_info.read_source_index);
 
     /// Pin the read to the object generation seen here (etag from the LIST/HEAD): a GET with a
-    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ
-    /// instead of torn cross-generation data.
-    if (settings[Setting::s3_validate_etag_on_read] && object_info.metadata.has_value())
+    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ or
+    /// AZURE_OBJECT_CHANGED_DURING_READ instead of torn cross-generation data.
+    if (validate_etag_on_read && object_info.metadata.has_value())
         stored_object.etag = object_info.metadata->etag;
     pipeline.setSource(object_storage, StoredObjects{stored_object}, modified_read_settings);
 

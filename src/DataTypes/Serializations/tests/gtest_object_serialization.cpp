@@ -188,7 +188,7 @@ TEST(ObjectSerialization, FlattenAndBucketSharedDataPaths)
 }
 
 /// The shared-data-paths statistics count in the ObjectStructure prefix is only read when
-/// `object_and_dynamic_read_statistics` is enabled -- the MergeTree part read path, which the
+/// `read_statistics` is enabled -- the MergeTree part read path, which the
 /// `Native` input format (covered by 04350_json_native_too_many_paths) never reaches, since it
 /// always leaves statistics disabled. A corrupted count there must be rejected with a clean
 /// `INCORRECT_DATA` error instead of escaping as an uncaught `std::bad_alloc` /
@@ -212,7 +212,7 @@ TEST(ObjectSerialization, TooManySharedDataPathsStatistics)
     ReadBufferFromString structure_stream(structure_bytes);
 
     ISerialization::DeserializeBinaryBulkSettings settings;
-    settings.object_and_dynamic_read_statistics = true;
+    settings.read_statistics = true;
     settings.getter = [&](const ISerialization::SubstreamPath & path) -> ReadBuffer *
     {
         if (!path.empty() && path.back().type == ISerialization::Substream::ObjectStructure)
@@ -374,10 +374,10 @@ static void expectGranulePathCountRejected(size_t num_paths, int expected_error_
     ISerialization::DeserializeBinaryBulkStatePtr state;
     serialization->deserializeBinaryBulkStatePrefix(settings, state, nullptr);
 
-    ColumnPtr column = DataTypeObject::getTypeOfSharedData()->createColumn();
+    auto column = DataTypeObject::getTypeOfSharedData()->createColumn();
     try
     {
-        serialization->deserializeBinaryBulkWithMultipleStreams(column, /*rows_offset=*/0, /*limit=*/1, settings, state, nullptr);
+        serialization->deserializeBinaryBulkWithMultipleStreams(*column, /*limit=*/1, settings, state, nullptr);
         FAIL() << "Expected an exception for a corrupted granule num_paths count " << num_paths;
     }
     catch (const Exception & e)

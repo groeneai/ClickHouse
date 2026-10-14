@@ -4,6 +4,7 @@
 #include <tuple>
 #include <base/defines.h>
 #include <Common/AggregatedMetrics.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/SimpleIncrement.h>
 #include <Common/SharedMutex.h>
 #include <Common/MultiVersion.h>
@@ -39,6 +40,7 @@
 #include <Poco/Timestamp.h>
 #include <Common/ThreadPool_fwd.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
+#include <Storages/MergeTree/PatchParts/PatchPartIndex.h>
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -620,7 +622,8 @@ public:
         virtual MutationCommands getOnFlyMutationCommandsForPart(const DataPartPtr & part) const = 0;
         virtual PatchParts getPatchesForPart(const DataPartPtr & part) const = 0;
         virtual std::shared_ptr<IMutationsSnapshot> cloneEmpty() const = 0;
-        virtual NameSet getAllUpdatedColumns() const = 0;
+        /// Columns changed on the fly by patches, data mutations and alter mutations of the whole snapshot.
+        virtual NameSet getColumnsChangedOnFly() const = 0;
 
         virtual bool hasPatchParts() const = 0;
         virtual bool hasDataMutations() const = 0;
@@ -652,6 +655,8 @@ public:
     protected:
         NameSet getColumnsUpdatedInPatches() const;
         void addSupportedCommands(const MutationCommands & commands, UInt64 mutation_version, MutationCommands & result_commands) const;
+        /// Adds the columns changed by the commands that are applied on the fly in this snapshot.
+        void addColumnsChangedOnFly(const MutationCommands & commands, NameSet & result) const;
     };
 
     using MutationsSnapshotPtr = std::shared_ptr<const IMutationsSnapshot>;
@@ -1327,6 +1332,11 @@ public:
 #endif
         );
 
+#if CLICKHOUSE_CLOUD
+    /// Commands that apply the enabled masking policies on the fly.
+    static MutationCommands getMaskingPolicyCommands(const StorageID & storage_id, const EnabledMaskingPoliciesPtr & enabled_masking_policies);
+#endif
+
     /// Returns destination disk or volume for the TTL rule according to current storage policy.
     SpacePtr getDestinationForMoveTTL(const TTLDescription & move_ttl) const;
 
@@ -1343,12 +1353,16 @@ public:
     size_t getTotalMergesWithTTLInMergeList() const;
 
     constexpr static auto EMPTY_PART_TMP_PREFIX = "tmp_empty_";
+
     /// `metadata_snapshot` must come from the source part being covered
     /// (via `IMergeTreeDataPart::getMetadataSnapshot`) so patch parts get patch-part metadata.
+    /// For a part in a patch partition, `patch_part_index` must be seeded from a covered or
+    /// sibling part (see `PatchPartIndex::cloneEmpty`) to keep the partition uniform.
     std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> createEmptyPart(
         MergeTreePartInfo & new_part_info, const MergeTreePartition & partition,
         const String & new_part_name, const StorageMetadataPtr & metadata_snapshot,
-        const MergeTreeTransactionPtr & txn) const;
+        const MergeTreeTransactionPtr & txn,
+        std::optional<PatchPartIndex> patch_part_index) const;
 
     MergeTreeDataFormatVersion format_version;
 
@@ -1510,7 +1524,11 @@ public:
     void triggerBackgroundOperations();
 
     /// Returns cached metadata snapshot of a patch part that contains the following columns.
-    StorageMetadataPtr getPatchPartMetadata(const ColumnsDescription & patch_part_desc, const String & patch_partition_id, ContextPtr local_context) const;
+    PatchPartMetadata getPatchPartMetadata(const IMergeTreeDataPart & patch_part, ContextPtr local_context) const;
+
+    /// Returns the effective sorting key for applying a v2 patch part:
+    /// the longest common prefix of the patch's persisted sorting key and the table's current sorting key.
+    std::shared_ptr<const KeyDescription> getPatchPartSortingKey(const IMergeTreeDataPart & patch_part) const;
 
     static MergingParams getMergingParamsForPatchParts();
 
@@ -1703,11 +1721,16 @@ protected:
     /// protected by @data_parts_mutex.
     SerializationInfoByName serialization_hints{{}};
 
-    /// A cache for metadata snapshots for patch parts.
-    /// The key is a partition id of patch part.
-    /// Patch parts in one partition always have the same structure.
+    /// Cached metadata used to read patch parts, by the structure hash from their partition id.
+    /// Bounded by the number of distinct structures of patch parts.
     mutable std::mutex patch_parts_metadata_mutex;
-    mutable std::unordered_map<String, StorageMetadataPtr> patch_parts_metadata_cache;
+    mutable std::unordered_map<String, PatchPartMetadata> patch_parts_metadata_cache;
+
+    /// Cached effective sorting keys for applying v2 patch parts.
+    /// An effective key is a prefix of the table's current sorting key, so it is identified by its size.
+    /// Invalidated on ALTER: the effective key depends on the table's current sorting key.
+    mutable std::mutex patch_parts_sorting_keys_mutex;
+    mutable std::map<size_t, std::shared_ptr<const KeyDescription>> patch_parts_sorting_keys_cache;
 
     MergeTreePartsMover parts_mover;
 
@@ -2063,6 +2086,8 @@ protected:
     std::mutex refresh_parts_mutex;
 
     BackgroundSchedulePoolTaskHolder refresh_stats_task;
+    /// Set before `refresh_stats_task` is deactivated, so that a running `refreshStatistics` returns between parts.
+    std::atomic_bool refresh_stats_cancelled = false;
 
     mutable std::mutex stats_mutex;
     ConditionSelectivityEstimatorPtr cached_estimator;
@@ -2081,7 +2106,14 @@ protected:
 
     std::vector<LoadPartResult> loadDataPartsFromDisk(PartLoadingTreeNodes & parts_to_load);
 
-    QueryPipeline updateLightweightImpl(const MutationCommands & commands, ContextPtr query_context);
+    struct LightweightUpdateResult
+    {
+        QueryPipeline pipeline;
+        PatchPartMetadata patch_metadata;
+    };
+
+    /// Builds a pipeline that reads the updated rows and the metadata of the new patch part.
+    LightweightUpdateResult updateLightweightImpl(const MutationCommands & commands, ContextPtr query_context);
 
     static MutableDataPartPtr asMutableDeletingPart(const DataPartPtr & part);
 

@@ -31,6 +31,7 @@
 #include <Functions/indexHint.h>
 
 #include <Interpreters/ExpressionActionsSettings.h>
+#include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/Set.h>
 
@@ -50,7 +51,6 @@ namespace Setting
     extern const SettingsBool enable_named_columns_in_function_tuple;
     extern const SettingsBool transform_null_in;
     extern const SettingsInt64 optimize_const_name_size;
-    extern const SettingsBool format_display_secrets_in_show_and_select;
 }
 
 namespace ErrorCodes
@@ -1224,24 +1224,17 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
 /// gates on the setting).
 void markFoldedSecretConstants(const FunctionNode & function_node, const ActionsDAG::NodeRawConstPtrs & children)
 {
-    auto secret_arguments = FunctionSecretArgumentsFinderTreeNode(function_node).getResult();
+    const auto secret_arguments = FunctionSecretArgumentsFinderTreeNode(function_node).getResult();
     if (!secret_arguments.hasSecrets())
         return;
 
-    auto mark = [&](size_t index)
+    for (size_t i = 0; i < children.size(); ++i)
     {
         /// Any node carrying a constant column is a folded secret value, whether it is a plain COLUMN
         /// node or a FUNCTION node folded to a constant (e.g. `concat(k1, k2)`); flag either.
-        if (index < children.size() && children[index]->column && !children[index]->is_masked_secret)
-            const_cast<ActionsDAG::Node *>(children[index])->is_masked_secret = true;
-    };
-
-    for (size_t i = secret_arguments.start; i < secret_arguments.start + secret_arguments.count; ++i)
-        mark(i);
-    for (const auto & [index, _] : secret_arguments.masked_arguments)
-        mark(index);
-    for (const auto & [index, _] : secret_arguments.replaced_arguments)
-        mark(index);
+        if (secret_arguments.isSecretArgument(i) && children[i]->column && !children[i]->is_masked_secret)
+            const_cast<ActionsDAG::Node *>(children[i])->is_masked_secret = true;
+    }
 }
 
 PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitFunction(const QueryTreeNodePtr & node)
@@ -1338,7 +1331,7 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
     for (auto & function_argument_node_name : function_arguments_node_names)
         children.push_back(actions_stack[level].getNodeOrThrow(function_argument_node_name));
 
-    if (!planner_context->getQueryContext()->getSettingsRef()[Setting::format_display_secrets_in_show_and_select])
+    if (!canDisplaySecrets(planner_context->getQueryContext()))
         markFoldedSecretConstants(function_node, children);
 
     if (function_node.getFunctionName() == "arrayJoin")

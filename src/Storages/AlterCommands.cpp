@@ -48,6 +48,7 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Common/typeid_cast.h>
 #include <Common/quoteString.h>
@@ -104,6 +105,14 @@ namespace MergeTreeSetting
 
 namespace
 {
+
+/// Whether the two names name one setting: a `MergeTree` setting can have two names.
+bool isSameSetting(const String & left, const String & right)
+{
+    auto resolve = [](const String & name)
+    { return MergeTreeSettings::hasBuiltin(name) ? MergeTreeSettings::resolveName(name) : std::string_view(name); };
+    return resolve(left) == resolve(right);
+}
 
 AlterCommand::RemoveProperty removePropertyFromString(const String & property)
 {
@@ -1167,27 +1176,37 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context,
         auto & settings_from_storage = metadata.settings_changes->as<ASTSetQuery &>().changes;
         for (const auto & change : settings_changes)
         {
-            auto finder = [&change](const SettingChange & c) { return c.name == change.name; };
-            auto it = std::find_if(settings_from_storage.begin(), settings_from_storage.end(), finder);
+            auto same_setting = [&change](const SettingChange & c) { return isSameSetting(c.name, change.name); };
+            auto it = std::find_if(settings_from_storage.begin(), settings_from_storage.end(), same_setting);
 
-            if (it != settings_from_storage.end())
-                it->value = change.value;
-            else
+            if (it == settings_from_storage.end())
+            {
                 settings_from_storage.push_back(change);
+                continue;
+            }
+
+            /// The statement states the setting under a name of its own choosing, which need not be the one
+            /// the definition was written with. It is still one setting, so it is left holding one entry:
+            /// a definition can state a setting under each of its names, and the last of them is in effect.
+            it->name = change.name;
+            it->value = change.value;
+            settings_from_storage.erase(
+                std::remove_if(it + 1, settings_from_storage.end(), same_setting), settings_from_storage.end());
         }
 
         MergeTreeSettings effective_settings;
-        bool any_mt_setting = false;
+        SettingsChanges builtin_changes;
         for (const auto & change : settings_from_storage)
         {
             if (MergeTreeSettings::hasBuiltin(change.name))
-            {
-                effective_settings.applyChange(change, context, /*is_loading_from_existing_metadata=*/true);
-                any_mt_setting = true;
-            }
+                builtin_changes.push_back(change);
         }
-        if (any_mt_setting)
+        if (!builtin_changes.empty())
         {
+            /// Only the implicit-index settings below are read here, and this runs before the statement is
+            /// known to be allowed, so the `disk` setting is left unresolved rather than creating the disk.
+            effective_settings.applyChangesLeavingDiskUnresolved(builtin_changes);
+
             metadata.add_minmax_index_for_numeric_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_numeric_columns];
             metadata.add_minmax_index_for_string_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_string_columns];
             metadata.add_minmax_index_for_temporal_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_temporal_columns];
@@ -1211,12 +1230,12 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context,
         auto & settings_from_storage = metadata.settings_changes->as<ASTSetQuery &>().changes;
         for (const auto & setting_name : settings_resets)
         {
-            auto finder = [&setting_name](const SettingChange & c) { return c.name == setting_name; };
-            auto it = std::find_if(settings_from_storage.begin(), settings_from_storage.end(), finder);
+            auto same_setting = [&setting_name](const SettingChange & c) { return isSameSetting(c.name, setting_name); };
+            auto it = std::remove_if(settings_from_storage.begin(), settings_from_storage.end(), same_setting);
 
             if (it != settings_from_storage.end())
             {
-                settings_from_storage.erase(it);
+                settings_from_storage.erase(it, settings_from_storage.end());
             }
             else
             {
@@ -1267,14 +1286,7 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context,
             /// For implicit indices, check the index name rather than column_names because
             /// for ALIAS columns, column_names contains the underlying expression columns.
             if (index.isImplicitlyCreated() && index.name == IMPLICITLY_ADDED_MINMAX_INDEX_PREFIX + column_name)
-            {
                 index.definition_ast = createImplicitMinMaxIndexAST(rename_to);
-                index.name = IMPLICITLY_ADDED_MINMAX_INDEX_PREFIX + rename_to;
-                /// For an ALIAS column the index covers the columns its expression expands to,
-                /// which the column's own name never appears in, so a rename does not affect them.
-                if (!metadata.columns.hasAlias(rename_to))
-                    index.column_names = {rename_to};
-            }
             else
                 rename_visitor.visit(index.definition_ast);
         }
@@ -2016,7 +2028,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
     const auto virtuals = metadata->virtuals;
 
     bool share_nested = true;
-    if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+    if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
         share_nested = (*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets];
 
     auto all_columns = metadata->columns;
@@ -2313,7 +2325,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
             if (all_columns.hasNested(command.column_name))
             {
                 bool skip = false;
-                if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+                if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
                     skip = !(*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets];
                 if (!skip)
                     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot rename whole Nested struct");
@@ -2356,7 +2368,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
 
             /// When share_nested_offsets is disabled, dotted-name columns are independent
             /// and not part of a Nested group, so they can be freely renamed.
-            if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+            if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
             {
                 if (!(*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets])
                 {

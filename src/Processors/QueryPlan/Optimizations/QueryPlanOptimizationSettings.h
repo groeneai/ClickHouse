@@ -55,6 +55,7 @@ struct QueryPlanOptimizationSettings
     bool merge_expressions;
     bool merge_filters;
     bool filter_push_down;
+    bool filter_push_down_below_limit_by;
     bool push_down_volume_reducing_functions;
     bool convert_outer_join_to_inner_join;
     bool short_circuit_constant_false_join;
@@ -106,7 +107,6 @@ struct QueryPlanOptimizationSettings
     bool use_query_condition_cache;
     bool use_query_condition_cache_for_top_k;
     bool read_in_order_through_join;
-    bool read_in_order_through_spilling_join;
     bool optimize_aggregation_in_order_limit;
     bool correlated_subqueries_use_in_memory_buffer;
     bool push_limit_by_into_sort;

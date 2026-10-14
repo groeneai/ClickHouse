@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <set>
@@ -91,6 +92,7 @@
 #include <Core/SettingsQuirks.h>
 #include <Core/UUID.h>
 #include <Access/AccessControl.h>
+#include <Access/resolveSetting.h>
 #include <Access/ContextAccess.h>
 #include <Access/EnabledRolesInfo.h>
 #include <Access/EnabledRowPolicies.h>
@@ -308,14 +310,15 @@ namespace Setting
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsBool cloud_mode;
     extern const SettingsString default_format;
-    extern const SettingsBool read_through_distributed_cache;
-    extern const SettingsBool write_through_distributed_cache;
+    extern const SettingsBoolAuto force_read_through_distributed_cache;
+    extern const SettingsBoolAuto force_write_through_distributed_cache;
     extern const SettingsBool enable_filesystem_cache;
     extern const SettingsBool enable_filesystem_cache_log;
     extern const SettingsBool enable_filesystem_cache_on_write_operations;
     extern const SettingsBool enable_filesystem_read_prefetches_log;
     extern const SettingsBool enable_blob_storage_log;
     extern const SettingsBool enable_blob_storage_log_for_read_operations;
+    extern const SettingsUInt64 filesystem_cache_boundary_alignment;
     extern const SettingsUInt64 filesystem_cache_max_download_size;
     extern const SettingsUInt64 filesystem_cache_reserve_space_wait_lock_timeout_milliseconds;
     extern const SettingsUInt64 filesystem_cache_wait_for_concurrent_download_timeout_milliseconds;
@@ -429,6 +432,8 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_thread_pool_size;
     extern const ServerSettingsBool s3queue_disable_streaming;
     extern const ServerSettingsBool message_queue_disable_insertion;
+    extern const ServerSettingsBool enable_read_through_distributed_cache;
+    extern const ServerSettingsBool enable_write_through_distributed_cache;
     extern const ServerSettingsUInt64 tables_loader_background_pool_size;
     extern const ServerSettingsUInt64 tables_loader_foreground_pool_size;
     extern const ServerSettingsNonZeroUInt64 prefetch_threadpool_pool_size;
@@ -1365,6 +1370,7 @@ ContextData::ContextData(const ContextData &o) :
     input_blocks_reader(o.input_blocks_reader),
     user_id(o.user_id),
     current_roles(o.current_roles),
+    external_roles(o.external_roles),
     settings_constraints_and_current_profiles(o.settings_constraints_and_current_profiles),
     access(o.access),
     need_recalculate_access(o.need_recalculate_access),
@@ -2168,6 +2174,8 @@ void Context::setUser(const UUID & user_id_, const std::vector<UUID> & external_
     auto enabled_roles = access_control.getEnabledRolesInfo(default_roles, {});
     auto enabled_profiles = access_control.getEnabledSettingsInfo(user_id_, user->settings, enabled_roles->enabled_roles, enabled_roles->settings_from_enabled_roles);
     const auto & database = user->default_database;
+    if (!database.empty())
+        DatabaseCatalog::instance().assertDatabaseExists(database);
 
     /// Apply user's profiles, constraints, settings, roles.
     std::lock_guard lock(mutex);
@@ -2225,15 +2233,16 @@ void Context::setCurrentRolesWithLock(const std::vector<UUID> & new_current_role
 
 void Context::setExternalRolesWithLock(const std::vector<UUID> & new_external_roles, const std::lock_guard<ContextSharedMutex> &)
 {
-    // External roles are roles received from other node, current roles is a collection of roles that were assigned locally
-    if (!new_external_roles.empty())
-    {
-        if (external_roles)
-            external_roles->insert(external_roles->end(), new_external_roles.begin(), new_external_roles.end());
-        else
-            external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
-        need_recalculate_access = true;
-    }
+    // External roles are roles received from another node; current roles is a collection of roles that were assigned locally.
+    // Replace them unconditionally (rather than append) so that switching the principal via `setUser` clears any external
+    // roles carried over from a previous principal on the same or a copied context. `ContextData`'s copy constructor
+    // preserves `external_roles`, so without this reset a context authenticated with pushed roles would keep them after
+    // `setUser(target_user)` (e.g. `EXECUTE AS target_user`), silently widening the target's privileges.
+    if (new_external_roles.empty())
+        external_roles = nullptr;
+    else
+        external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
+    need_recalculate_access = true;
 }
 
 void Context::setCurrentRolesImpl(const std::vector<UUID> & new_current_roles, bool throw_if_not_granted, bool skip_if_not_granted, const std::shared_ptr<const User> & user)
@@ -3068,7 +3077,9 @@ StoragePtr Context::executeTableFunction(const ASTPtr & table_expression, const 
             create.set(create.sql_security, sql_security);
 
             auto view_context = view_metadata->getSQLSecurityOverriddenContext(shared_from_this());
-            auto sample_block = InterpreterSelectWithUnionQuery::getSampleBlock(query, view_context);
+            auto sample_block = getSettingsRef()[Setting::allow_experimental_analyzer]
+                ? InterpreterSelectQueryAnalyzer::getSampleBlock(query, view_context)
+                : InterpreterSelectWithUnionQuery::getSampleBlock(query, view_context);
             auto res = std::make_shared<StorageView>(StorageID(database_name, table_name),
                                                      create,
                                                      ColumnsDescription(sample_block->getNamesAndTypesList()),
@@ -3377,6 +3388,12 @@ StoragePtr Context::getViewSource() const
     return view_source;
 }
 
+
+void Context::clearViewSource()
+{
+    view_source.reset();
+}
+
 bool Context::displaySecretsInShowAndSelect() const
 {
     return shared->server_settings[ServerSetting::display_secrets_in_show_and_select];
@@ -3386,6 +3403,41 @@ Settings Context::getSettingsCopy() const
 {
     SharedLockGuard lock(mutex);
     return *settings;
+}
+
+namespace
+{
+bool isProfileChange(const SettingChange & change)
+{
+    return change.name == "profile";
+}
+
+/// Enforces the constraints on `changes` the way `applySettingsChanges` applies them: a `profile` change
+/// installs a new constraint set for the changes after it. Each run of changes up to the next `profile`
+/// change is enforced against the constraints in force before it, then applied together with that `profile`
+/// change to a scratch copy of `context`, so a rejected list leaves `context` untouched. Returns the enforced list.
+template <typename Enforce>
+SettingsChanges enforceConstraintsAlongProfileChanges(const ContextPtr & context, const SettingsChanges & changes, Enforce && enforce)
+{
+    auto scratch_context = Context::createCopy(context);
+    SettingsChanges enforced;
+    for (auto begin = changes.begin(); begin != changes.end();)
+    {
+        auto profile = std::find_if(begin, changes.end(), isProfileChange);
+        SettingsChanges segment(begin, profile);
+        enforce(*scratch_context, segment);
+        begin = profile;
+        if (profile != changes.end())
+        {
+            segment.push_back(*profile);
+            ++begin;
+        }
+        /// `setCurrentProfile` checks the profile's own settings against the constraints in force before it.
+        scratch_context->applySettingsChanges(segment);
+        enforced.insert(enforced.end(), segment.begin(), segment.end());
+    }
+    return enforced;
+}
 }
 
 void Context::setSettings(const Settings & settings_)
@@ -3548,6 +3600,15 @@ void Context::checkSettingsConstraints(const SettingChange & change, SettingSour
 
 void Context::checkSettingsConstraints(const SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(std::as_const(segment), source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     settings->checkShorthandChanges(changes);
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.check(*settings, changes, source);
@@ -3560,14 +3621,46 @@ void Context::checkSettingsConstraintsForSettingsReset(const std::vector<String>
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.checkResetToDefault(*settings, names, source);
 }
 
+void Context::checkSettingsConstraintsForSettingsReset(
+    const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source)
+{
+    if (std::ranges::none_of(changes_applied_first, isProfileChange))
+    {
+        checkSettingsConstraintsForSettingsReset(names, source);
+        return;
+    }
+    /// The resets take effect after the rest of the statement, so a `profile` change in it decides the constraints.
+    auto scratch_context = Context::createCopy(shared_from_this());
+    scratch_context->applySettingsChanges(changes_applied_first);
+    scratch_context->checkSettingsConstraintsForSettingsReset(names, source);
+}
+
 void Context::checkSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     checkSettingsConstraintsWithLock(changes, source);
 }
 
 void Context::clampToSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.clampToSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     clampToSettingsConstraintsWithLock(changes, source);
 }
@@ -3581,8 +3674,14 @@ void Context::checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_
 void Context::resetSettingsToDefaultValue(const std::vector<String> & names)
 {
     std::lock_guard lock(mutex);
-    for (const String & name: names)
+    for (const String & name : names)
+    {
         settings->setDefaultValue(name);
+        /// `Settings` stores a `merge_tree_`-prefixed name as a custom setting, under the exact name that
+        /// wrote it. Resetting one name of a setting therefore has to clear what its other names wrote.
+        for (const auto & equivalent_name : settingEquivalentNames(name))
+            settings->setDefaultValue(equivalent_name);
+    }
 }
 
 std::shared_ptr<const SettingsConstraintsAndProfileIDs> Context::getSettingsConstraintsAndCurrentProfilesWithLock() const
@@ -3635,12 +3734,13 @@ void Context::setCurrentDatabaseNameInGlobalContext(const String & name)
     current_database = name;
 }
 
+/// Existence is checked by the callers before they take `mutex`: the check resolves typo hints,
+/// which read this same `mutex`.
 void Context::setCurrentDatabaseWithLock(const String & name, const std::lock_guard<ContextSharedMutex> &)
 {
     if (name.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Database name cannot be empty");
 
-    DatabaseCatalog::instance().assertDatabaseExists(name);
     current_database = name;
     mirrorCurrentDatabaseIntoSetting(name);
     need_recalculate_access = true;
@@ -3648,6 +3748,8 @@ void Context::setCurrentDatabaseWithLock(const String & name, const std::lock_gu
 
 void Context::setCurrentDatabase(const String & name)
 {
+    DatabaseCatalog::instance().assertDatabaseExists(name);
+
     std::lock_guard lock(mutex);
     setCurrentDatabaseWithLock(name, lock);
 }
@@ -6148,12 +6250,20 @@ void Context::signalKeeperDispatcherShutdown() const
 #endif
 }
 
-void Context::shutdownKeeperDispatcher([[maybe_unused]] bool closed_all_connections) const
+void Context::shutdownKeeperDispatcherBeforeConnectionsFinish() const
+{
+#if USE_NURAFT
+    if (auto dispatcher = tryGetKeeperDispatcher())
+        dispatcher->shutdownBeforeConnectionsFinish();
+#endif
+}
+
+void Context::shutdownKeeperDispatcherAfterConnectionsFinish([[maybe_unused]] bool closed_all_connections) const
 {
 #if USE_NURAFT
     if (auto dispatcher = tryGetKeeperDispatcher())
     {
-        dispatcher->shutdown(closed_all_connections);
+        dispatcher->shutdownAfterConnectionsFinish(closed_all_connections);
         setKeeperDispatcher(nullptr);
     }
 #endif
@@ -6549,6 +6659,44 @@ bool Context::getMessageQueueDisableInsertion() const
     SharedLockGuard lock(shared->mutex);
     return shared->server_settings[ServerSetting::message_queue_disable_insertion]
         || shared->server_settings[ServerSetting::disable_insertion_and_mutation];
+}
+
+bool Context::getReadThroughDistributedCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->server_settings[ServerSetting::enable_read_through_distributed_cache];
+}
+
+void Context::setReadThroughDistributedCache(bool read_through_distributed_cache) const
+{
+    std::lock_guard lock(shared->mutex);
+    shared->server_settings.set("enable_read_through_distributed_cache", read_through_distributed_cache);
+}
+
+bool Context::getWriteThroughDistributedCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->server_settings[ServerSetting::enable_write_through_distributed_cache];
+}
+
+void Context::setWriteThroughDistributedCache(bool write_through_distributed_cache) const
+{
+    std::lock_guard lock(shared->mutex);
+    shared->server_settings.set("enable_write_through_distributed_cache", write_through_distributed_cache);
+}
+
+bool Context::resolveReadThroughDistributedCache() const
+{
+    if (isGlobalContext())
+        return getReadThroughDistributedCache();
+    return getSettingsRef()[Setting::force_read_through_distributed_cache].valueOr(getReadThroughDistributedCache());
+}
+
+bool Context::resolveWriteThroughDistributedCache() const
+{
+    if (isGlobalContext())
+        return getWriteThroughDistributedCache();
+    return getSettingsRef()[Setting::force_write_through_distributed_cache].valueOr(getWriteThroughDistributedCache());
 }
 
 std::shared_ptr<Cluster> Context::getCluster(const std::string & cluster_name) const
@@ -8006,11 +8154,6 @@ void Context::increaseDistributedDepth()
     ++client_info.distributed_depth;
 }
 
-void Context::setClientTraceContext(const OpenTelemetry::TracingContext & trace_context)
-{
-    client_info.client_trace_context = trace_context;
-}
-
 
 StorageID Context::resolveStorageID(StorageID storage_id, StorageNamespace where) const
 {
@@ -8592,6 +8735,9 @@ ReadSettings Context::getReadSettings() const
         = settings_ref[Setting::filesystem_cache_enable_background_download_during_fetch];
     res.filesystem_cache_settings.prefer_bigger_buffer_size = settings_ref[Setting::filesystem_cache_prefer_bigger_buffer_size];
 
+    if (settings_ref[Setting::filesystem_cache_boundary_alignment])
+        res.filesystem_cache_settings.boundary_alignment = settings_ref[Setting::filesystem_cache_boundary_alignment];
+
     res.filesystem_cache_settings.max_download_size_per_query = settings_ref[Setting::filesystem_cache_max_download_size];
     res.filesystem_cache_settings.skip_download_if_exceeds_per_query_cache_write_limit
         = settings_ref[Setting::filesystem_cache_skip_download_if_exceeds_per_query_cache_write_limit];
@@ -8653,7 +8799,7 @@ ReadSettings Context::getReadSettings() const
     res.remote_fs_settings.enable_hdfs_pread = settings_ref[Setting::enable_hdfs_pread];
     res.remote_fs_settings.enable_blob_storage_log = settings_ref[Setting::enable_blob_storage_log_for_read_operations];
 
-    res.read_through_distributed_cache = settings_ref[Setting::read_through_distributed_cache];
+    res.read_through_distributed_cache = resolveReadThroughDistributedCache();
 #if ENABLE_DISTRIBUTED_CACHE
     res.distributed_cache_settings.load(settings_ref);
     res.distributed_cache_settings.validate();
@@ -8679,7 +8825,7 @@ WriteSettings Context::getWriteSettings() const
     res.remote_throttler = getRemoteWriteThrottler();
     res.local_throttler = getLocalWriteThrottler();
 
-    res.write_through_distributed_cache = settings_ref[Setting::write_through_distributed_cache];
+    res.write_through_distributed_cache = resolveWriteThroughDistributedCache();
 #if ENABLE_DISTRIBUTED_CACHE
     res.distributed_cache_settings.load(settings_ref);
 #endif

@@ -3,6 +3,8 @@
 #pragma clang diagnostic ignored "-Wdocumentation-html"
 
 #include <Common/Exception.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <DataTypes/Serializations/SimpleTextSerialization.h>
 #include <boost/algorithm/string/join.hpp>
 
@@ -109,8 +111,7 @@ public:
         SerializeBinaryBulkStatePtr & state) const override;
 
     void deserializeBinaryBulkWithMultipleStreams(
-        ColumnPtr & column,
-        size_t rows_offset,
+        IColumn & column,
         size_t limit,
         DeserializeBinaryBulkSettings & settings,
         DeserializeBinaryBulkStatePtr & state,
@@ -135,7 +136,7 @@ private:
         std::map<size_t, String> position_to_requested_path;
         /// List of all paths stored in the granule. It is filled only if whole
         /// shared data is deserialized when we need the list of all paths.
-        std::vector<String> all_paths;
+        VectorWithMemoryTracking<String> all_paths;
         /// Number of rows in this granule.
         size_t num_rows = 0;
         /// How much rows should be read from this granule. Can be less than num_rows if we read only a part of the granule.
@@ -211,13 +212,15 @@ private:
 
     static DeserializeBinaryBulkStatePtr deserializeStructureStatePrefix(DeserializeBinaryBulkSettings & settings, SubstreamsDeserializeStatesCache * cache);
 
-    /// Deserialize data from ObjectSharedDataStructure stream with specified offset/limit.
+    /// Deserialize data from ObjectSharedDataStructure stream with specified limit.
     static std::shared_ptr<StructureGranules> deserializeStructure(
-        size_t rows_offset,
         size_t limit,
         DeserializeBinaryBulkSettings & settings,
         DeserializeBinaryBulkStateObjectSharedDataStructure & structure_state,
         SubstreamsCache * cache);
+
+    /// The readers apply the granule layout of the first bucket to all of them.
+    static void checkGranulesMatchFirstBucket(const StructureGranules & granules, const StructureGranules & first_bucket_granules, size_t bucket);
 
     /// Deserialize prefix of the granule in ObjectSharedDataStructure(Prefix) stream that contains:
     ///   - number of rows in the granule
@@ -249,9 +252,9 @@ private:
         /// Mark of the substreams marks in ObjectSharedDataSubstreamsMarks stream for this path.
         MarkInCompressedFile substreams_marks_mark{};
         /// List of substreams for this path.
-        std::vector<String> substreams;
+        VectorWithMemoryTracking<String> substreams;
         /// Map Substream -> its mark in ObjectSharedDataData stream.
-        std::unordered_map<std::string_view, MarkInCompressedFile> substream_to_mark;
+        UnorderedMapWithMemoryTracking<std::string_view, MarkInCompressedFile> substream_to_mark;
     };
 
     struct PathsInfos
@@ -293,30 +296,6 @@ private:
     struct SubstreamsCachePathsDataElement : public ISubstreamsCacheElement
     {
         explicit SubstreamsCachePathsDataElement(std::shared_ptr<PathsDataGranules> paths_data_granules_) : paths_data_granules(paths_data_granules_) {}
-
-        void forEachColumn(const std::function<void(const ColumnPtr &)> & callback) const override
-        {
-            if (!paths_data_granules)
-                return;
-
-            for (const auto & granule : *paths_data_granules)
-            {
-                for (const auto & [path, column] : granule.paths_data)
-                {
-                    if (column)
-                        callback(column);
-                }
-
-                for (const auto & [path, subcolumns] : granule.paths_subcolumns_data)
-                {
-                    for (const auto & [subcolumn_name, column] : subcolumns)
-                    {
-                        if (column)
-                            callback(column);
-                    }
-                }
-            }
-        }
 
         std::shared_ptr<PathsDataGranules> paths_data_granules;
     };

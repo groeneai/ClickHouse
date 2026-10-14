@@ -23,6 +23,7 @@
 #include <Interpreters/ClusterProxy/distributedIndexAnalysis.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Storages/StorageProxy.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/InterpreterSelectQuery.h>
@@ -497,15 +498,10 @@ ReadFromMergeTree::ReadFromMergeTree(
 {
     if (is_parallel_reading_from_replicas)
     {
-        if (all_ranges_callback_.has_value())
-            all_ranges_callback = all_ranges_callback_.value();
-        else
-            all_ranges_callback = context->getMergeTreeAllRangesCallback();
-
-        if (read_task_callback_.has_value())
-            read_task_callback = read_task_callback_.value();
-        else
-            read_task_callback = context->getMergeTreeReadTaskCallback();
+        /// Taken exactly as given: a read marked by `enableParallelReadingFromReplicasForSerialization`
+        /// is coordinated but carries no callbacks, because it is executed on the replicas, not here.
+        all_ranges_callback = std::move(all_ranges_callback_);
+        read_task_callback = std::move(read_task_callback_);
     }
 
     const auto & settings = context->getSettingsRef();
@@ -712,7 +708,8 @@ Pipe ReadFromMergeTree::readFromPool(
       * Because time spend during filling per thread tasks can be greater than whole query
       * execution for big tables with small limit.
       */
-    bool use_prefetched_read_pool = query_info.trivial_limit == 0 && (allow_prefetched_remote || allow_prefetched_local);
+    bool use_prefetched_read_pool = query_info.trivial_limit == 0 && !query_info.small_limit_above_array_join
+        && (allow_prefetched_remote || allow_prefetched_local);
 
     if (use_prefetched_read_pool)
     {
@@ -1663,10 +1660,7 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreams(
     if (num_streams > 1)
     {
         /// Reduce the number of num_streams if the data is small.
-        /// The comparison is done with a division rather than with `num_streams * info.min_marks_for_concurrent_read`,
-        /// because `num_streams` is derived from `max_streams_to_max_threads_ratio`, which is a `Float64` setting,
-        /// and the product can overflow. `info.min_marks_for_concurrent_read` is always at least one.
-        if (info.sum_marks / info.min_marks_for_concurrent_read < num_streams && parts_with_ranges.size() < num_streams)
+        if (info.sum_marks < num_streams * info.min_marks_for_concurrent_read && parts_with_ranges.size() < num_streams)
         {
             /*
             If the data is fragmented, then allocate the size of parts to num_streams. If the data is not fragmented, besides the sum_marks and
@@ -1890,9 +1884,7 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsWithOrder(
         /// Additional increase of streams number in case of skewed parts, like it's
         /// done in `spreadMarkRangesAmongStreams` won't affect overall performance
         /// due to the single downstream `MergingSortedTransform`.
-        /// As in `spreadMarkRangesAmongStreams`, the comparison avoids the overflow of
-        /// `num_streams * info.min_marks_for_concurrent_read`.
-        if (info.sum_marks / info.min_marks_for_concurrent_read < num_streams && parts_with_ranges.size() < num_streams)
+        if (info.sum_marks < num_streams * info.min_marks_for_concurrent_read && parts_with_ranges.size() < num_streams)
         {
             num_streams = std::max(
                 (info.sum_marks + info.min_marks_for_concurrent_read - 1) / info.min_marks_for_concurrent_read, parts_with_ranges.size());
@@ -2775,7 +2767,7 @@ void ReadFromMergeTree::buildIndexes(
                 return KeyCondition{
                     wrapped, query_context, minmax_columns.getNames(), minmax_expression_actions,
                     /* single_point_ = */ false,
-                    /* skip_analysis_ = */ skip_partition_pruning_ || !query_context->getSettingsRef()[Setting::use_partition_pruning] || !query_context->getSettingsRef()[Setting::use_skip_indexes]};
+                    /* skip_analysis_ = */ skip_partition_pruning_ || !query_context->getSettingsRef()[Setting::use_partition_pruning]};
             };
             indexes->minmax_idx_condition = std::make_shared<ConditionTemplate<KeyCondition>>(filter_dag_ptr, std::move(key_condition_factory), metadata_snapshot, query_context, skip_constant_folding);
         }
@@ -3768,6 +3760,11 @@ bool ReadFromMergeTree::requestReadingInOrder(size_t prefix_size, int direction,
     /// Disable read-in-order optimization for reverse order with final.
     /// Otherwise, it can lead to incorrect final behavior because the implementation may rely on the reading in direct order).
     if (direction != 1 && query_info.isFinal())
+        return false;
+
+    /// The prefix indexes this snapshot's sorting key, and a clone of its expression list is resized
+    /// to `prefix_size`, which appends null `ASTPtr` children when the prefix is longer than the key.
+    if (prefix_size > storage_snapshot->metadata->getSortingKey().column_names.size())
         return false;
 
     /// Only a later request that WIDENS an already-established prefix (distinct/aggregation-in-order
@@ -5152,9 +5149,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
 
         for (const auto & ranges : result.parts_with_ranges)
         {
-            read_ranges.emplace(
-                ranges.part_index_in_query,
-                SkipIndexReadInput{ranges.ranges, ranges.read_hints, ranges.part_starting_offset_in_query});
+            read_ranges.emplace(ranges.part_index_in_query, ranges);
             part_remaining_marks.emplace(ranges.part_index_in_query, ranges.getMarksCount());
         }
 
@@ -6561,7 +6556,7 @@ std::unique_ptr<IQueryPlanStep> ReadFromMergeTree::deserialize(Deserialization &
     StorageID table_id(database_name, table_name);
     auto storage_ptr = DatabaseCatalog::instance().getTable(table_id, ctx.context);
 
-    auto * merge_tree = dynamic_cast<MergeTreeData *>(storage_ptr.get());
+    auto * merge_tree = castStorage<MergeTreeData>(storage_ptr, DeferredTable::Load).get();
     if (!merge_tree)
         throw Exception(ErrorCodes::UNKNOWN_TABLE,
             "Table {} is not a MergeTree table", table_id.getNameForLogs());
@@ -6584,11 +6579,10 @@ std::unique_ptr<IQueryPlanStep> ReadFromMergeTree::deserialize(Deserialization &
         num_streams,
         /*max_block_numbers_to_read*/ nullptr,
         /*merge_tree_select_result_ptr*/ nullptr,
-        /// On a replica this rebuilds the read in parallel-reading mode: the ReadFromMergeTree ctor
-        /// resolves the coordinator callbacks from ctx.context (set by TCPHandler) and the replica number
-        /// from client_info. Passing no extension keeps those resolved from the context. This path is
-        /// only reached for a plan that will actually be executed (see the ctx.skipping short-circuit
-        /// above), so the callbacks are always present.
+        /// On a replica this rebuilds the read in parallel-reading mode. Passing no extension makes
+        /// `readFromParts` take the coordinator callbacks from ctx.context (set by TCPHandler) and the
+        /// replica number from client_info. This path is only reached for a plan that will actually be
+        /// executed (see the ctx.skipping short-circuit above), so the callbacks are always present.
         enable_parallel_reading,
         /*extension*/ nullptr);
 

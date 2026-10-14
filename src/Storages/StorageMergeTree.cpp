@@ -1,4 +1,5 @@
 #include <Storages/StorageMergeTree.h>
+#include <Storages/StorageProxy.h>
 
 #include <optional>
 #include <ranges>
@@ -119,6 +120,7 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
+    extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
     extern const MergeTreeSettingsDeduplicateMergeProjectionMode deduplicate_merge_projection_mode;
@@ -310,7 +312,10 @@ void StorageMergeTree::shutdown(bool)
         refresh_parts_task->deactivate();
 
     if (refresh_stats_task)
+    {
+        refresh_stats_cancelled = true;
         refresh_stats_task->deactivate();
+    }
 
     stopOutdatedAndUnexpectedDataPartsLoadingTask();
 
@@ -1244,13 +1249,17 @@ QueryPipeline StorageMergeTree::updateLightweight(const MutationCommands & comma
     /// Updates currently don't work with parallel replicas.
     context_copy->setSetting("max_parallel_replicas", Field(1));
 
-    auto pipeline = updateLightweightImpl(commands, context_copy);
-    auto patch_metadata = DB::getPatchPartMetadata(pipeline.getHeader(), context_copy);
-    auto sink = std::make_shared<MergeTreeSinkPatch>(*this, std::move(patch_metadata), std::move(update_holder), context_copy);
+    auto [pipeline, patch_metadata] = updateLightweightImpl(commands, context_copy);
+
+    auto sink = std::make_shared<MergeTreeSinkPatch>(
+        *this,
+        std::move(patch_metadata),
+        std::move(update_holder),
+        context_copy);
 
     chassert(!pipeline.completed());
     pipeline.complete(std::move(sink));
-    return pipeline;
+    return std::move(pipeline);
 }
 
 namespace
@@ -2607,6 +2616,7 @@ struct FutureNewEmptyPart
     std::string part_name;
     /// Metadata of the source part being covered; see `MergeTreeData::createEmptyPart`.
     StorageMetadataPtr metadata_snapshot;
+    std::optional<PatchPartIndex> patch_part_index;
 
     StorageMergeTree::MutableDataPartPtr data_part;
 };
@@ -2635,6 +2645,9 @@ static FutureNewEmptyParts initCoverageWithNewEmptyParts(const DataPartsVector &
         new_part.partition = old_part->partition;
         new_part.part_name = old_part->getNewName(new_part.part_info);
         new_part.metadata_snapshot = old_part->getMetadataSnapshot();
+
+        if (old_part->info.isPatch())
+            new_part.patch_part_index = old_part->getPatchPartIndex().cloneEmpty();
     }
 
     return future_parts;
@@ -2646,7 +2659,7 @@ static std::pair<StorageMergeTree::MutableDataPartsVector, std::vector<scope_gua
     std::pair<StorageMergeTree::MutableDataPartsVector, std::vector<scope_guard>> data_parts;
     for (auto & part: future_parts)
     {
-        auto [new_data_part, tmp_dir_holder] = data.createEmptyPart(part.part_info, part.partition, part.part_name, part.metadata_snapshot, txn);
+        auto [new_data_part, tmp_dir_holder] = data.createEmptyPart(part.part_info, part.partition, part.part_name, part.metadata_snapshot, txn, std::move(part.patch_part_index));
         data_parts.first.emplace_back(std::move(new_data_part));
         data_parts.second.emplace_back(std::move(tmp_dir_holder));
     }
@@ -3170,7 +3183,7 @@ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, con
         IDataPartStorage::ClonePartParams clone_params
         {
             .txn = local_context->getCurrentTransaction(),
-            .invalidated_columns_to_write = {BlockNumberColumn::name, BlockOffsetColumn::name},
+            .invalidated_columns_to_write = IMergeTreeDataPart::getSystemColumnsToInvalidate(src_part->info),
         };
         if (replace)
         {
@@ -3261,7 +3274,7 @@ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, con
 /// Clang's thread-safety analyzer, which cannot track mutex ownership across `std::lock`.
 void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr local_context) TSA_NO_THREAD_SAFETY_ANALYSIS
 {
-    auto dest_table_storage = std::dynamic_pointer_cast<StorageMergeTree>(dest_table);
+    auto dest_table_storage = std::dynamic_pointer_cast<StorageMergeTree>(resolveStorageProxyLoading(dest_table));
     if (!dest_table_storage)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Table {} supports movePartitionToTable only for MergeTree family of table engines. Got {}",
@@ -3366,7 +3379,7 @@ void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const
         {
             .txn = local_context->getCurrentTransaction(),
             .copy_instead_of_hardlink = (*getSettings())[MergeTreeSetting::always_use_copy_instead_of_hardlinks],
-            .invalidated_columns_to_write = {BlockNumberColumn::name, BlockOffsetColumn::name},
+            .invalidated_columns_to_write = IMergeTreeDataPart::getSystemColumnsToInvalidate(src_part->info),
         };
 
         auto [dst_part, part_lock] = dest_table_storage->cloneAndLoadDataPart(
@@ -3626,17 +3639,15 @@ MutationCommands StorageMergeTree::MutationsSnapshot::getOnFlyMutationCommandsFo
     return result;
 }
 
-NameSet StorageMergeTree::MutationsSnapshot::getAllUpdatedColumns() const
+NameSet StorageMergeTree::MutationsSnapshot::getColumnsChangedOnFly() const
 {
     NameSet res = getColumnsUpdatedInPatches();
     if (!hasDataMutations() && !hasAlterMutations())
         return res;
 
     for (const auto & [version, commands] : mutations_by_version)
-    {
-        auto names = commands->getAllUpdatedColumns();
-        std::move(names.begin(), names.end(), std::inserter(res, res.end()));
-    }
+        addColumnsChangedOnFly(*commands, res);
+
     return res;
 }
 

@@ -75,6 +75,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/MergeTree/ZeroCopyLock.h>
 #include <Storages/PartitionCommands.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
@@ -248,6 +249,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsMilliseconds wait_for_unique_parts_send_before_shutdown_ms;
     extern const MergeTreeSettingsString auto_statistics_types;
     extern const MergeTreeSettingsNonZeroUInt64 clone_replica_zookeeper_create_get_part_batch_size;
+    extern const MergeTreeSettingsMergeTreePatchPartsVersion patch_parts_version;
     extern const MergeTreeSettingsBool share_nested_offsets;
 }
 
@@ -3206,7 +3208,8 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
 
     auto clone_data_parts_from_source_table = [&] () -> size_t
     {
-        source_table = DatabaseCatalog::instance().tryGetTable(source_table_id, getContext());
+        /// Leaving this proxied would make the checks below read the source as not replicated.
+        source_table = resolveStorageProxyLoading(DatabaseCatalog::instance().tryGetTable(source_table_id, getContext()));
         if (!source_table)
         {
             LOG_DEBUG(log, "Can't use {} as source table for REPLACE PARTITION command. It does not exist.", source_table_id.getNameForLogs());
@@ -3338,7 +3341,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
         /// However, it's quite dangerous, because part may appear in source table.
         /// So we enqueue it for check only if no replicas of source table have part either.
         bool need_check = true;
-        if (auto * replicated_src_table = typeid_cast<StorageReplicatedMergeTree *>(source_table.get()))
+        if (auto * replicated_src_table = castStorage<StorageReplicatedMergeTree>(source_table, DeferredTable::Load).get())
         {
             String src_replica = replicated_src_table->findReplicaHavingPart(part_desc->src_part_name, false);
             if (!src_replica.empty())
@@ -3402,14 +3405,14 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
                 throw Exception(ErrorCodes::UNFINISHED, "Checksums of {} is suddenly changed", part_desc->src_table_part->name);
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
-            bool source_zero_copy_enabled = (*dynamic_cast<const MergeTreeData *>(source_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+            bool source_zero_copy_enabled = (*castStorage<MergeTreeData>(source_table, DeferredTable::Load)->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
             bool our_zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
             IDataPartStorage::ClonePartParams clone_params
             {
                 .copy_instead_of_hardlink = (*storage_settings_ptr)[MergeTreeSetting::always_use_copy_instead_of_hardlinks] || ((our_zero_copy_enabled || source_zero_copy_enabled) && part_desc->src_table_part->isStoredOnRemoteDiskWithZeroCopySupport()),
                 .metadata_version_to_write = metadata_snapshot->getMetadataVersion(),
-                .invalidated_columns_to_write = {BlockNumberColumn::name, BlockOffsetColumn::name},
+                .invalidated_columns_to_write = IMergeTreeDataPart::getSystemColumnsToInvalidate(part_desc->src_table_part->info),
             };
             auto [res_part, temporary_part_lock] = cloneAndLoadDataPart(
                 part_desc->src_table_part,
@@ -6121,7 +6124,10 @@ void StorageReplicatedMergeTree::shutdown(bool)
     if (refresh_parts_task)
         refresh_parts_task->deactivate();
     if (refresh_stats_task)
+    {
+        refresh_stats_cancelled = true;
         refresh_stats_task->deactivate();
+    }
 
     flushAndPrepareForShutdown();
 
@@ -8749,8 +8755,7 @@ QueryPipeline StorageReplicatedMergeTree::updateLightweight(const MutationComman
         waitForCommittingOpsToFinish(zookeeper, context_copy->getPartitionIdToMaxBlock(getStorageID().uuid), ops, backoff_ms, sync_timeout);
     }
 
-    auto pipeline = updateLightweightImpl(commands, context_copy);
-    auto patch_metadata = DB::getPatchPartMetadata(pipeline.getHeader(), context_copy);
+    auto [pipeline, patch_metadata] = updateLightweightImpl(commands, context_copy);
 
     auto sink = std::make_shared<ReplicatedMergeTreeSinkPatch>(
         *this,
@@ -8760,7 +8765,7 @@ QueryPipeline StorageReplicatedMergeTree::updateLightweight(const MutationComman
 
     chassert(!pipeline.completed());
     pipeline.complete(std::move(sink));
-    return pipeline;
+    return std::move(pipeline);
 }
 
 size_t StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()
@@ -9184,7 +9189,9 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
         if (replace)
             throw DB::Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Only support DROP/DETACH/ATTACH PARTITION ALL currently");
 
+        /// Patch parts cannot be copied to another table. Partitions with unapplied patches are rejected by `replacePartitionFromImpl`.
         partitions = src_data.getAllPartitionIds();
+        std::erase_if(partitions, isPatchPartitionId);
     }
     else
     {
@@ -9201,7 +9208,7 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
     const auto zookeeper = getZooKeeper();
 
     const bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-                || (*dynamic_cast<const MergeTreeData *>(source_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+                || (*src_data.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
     using Entry = std::unique_ptr<ReplicatedMergeTreeLogEntryData>;
     std::vector<Entry> entries(partitions.size());
@@ -9368,7 +9375,7 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
             {
                 .copy_instead_of_hardlink = always_use_copy_instead_of_hardlinks || (zero_copy_enabled && src_part->isStoredOnRemoteDiskWithZeroCopySupport()),
                 .metadata_version_to_write = metadata_snapshot->getMetadataVersion(),
-                .invalidated_columns_to_write = {BlockNumberColumn::name, BlockOffsetColumn::name},
+                .invalidated_columns_to_write = IMergeTreeDataPart::getSystemColumnsToInvalidate(src_part->info),
             };
             if (replace)
             {
@@ -9529,7 +9536,7 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
 void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::movePartitionToTable");
-    auto dest_table_storage = std::dynamic_pointer_cast<StorageReplicatedMergeTree>(dest_table);
+    auto dest_table_storage = castStorage<StorageReplicatedMergeTree>(dest_table, DeferredTable::Load);
     if (!dest_table_storage)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Table {} supports movePartitionToTable only for ReplicatedMergeTree family of table engines. "
@@ -9654,13 +9661,13 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
             bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-                || (*dynamic_cast<const MergeTreeData *>(dest_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+                || (*dest_table_storage->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
             IDataPartStorage::ClonePartParams clone_params
             {
                 .copy_instead_of_hardlink = (*storage_settings_ptr)[MergeTreeSetting::always_use_copy_instead_of_hardlinks] || (zero_copy_enabled && src_part->isStoredOnRemoteDiskWithZeroCopySupport()),
                 .metadata_version_to_write = dest_metadata_snapshot->getMetadataVersion(),
-                .invalidated_columns_to_write = {BlockNumberColumn::name, BlockOffsetColumn::name},
+                .invalidated_columns_to_write = IMergeTreeDataPart::getSystemColumnsToInvalidate(src_part->info),
             };
             auto [dst_part, dst_part_lock] = dest_table_storage->cloneAndLoadDataPart(
                 src_part,
@@ -11435,6 +11442,7 @@ bool StorageReplicatedMergeTree::createEmptyPartInsteadOfLost(zkutil::ZooKeeperP
     MergeTreePartition partition;
     /// Use a sibling part's metadata when possible so patch parts get patch-part metadata.
     StorageMetadataPtr metadata_snapshot = table_metadata;
+    std::optional<PatchPartIndex> patch_part_index;
     {
         auto lock = readLockParts();
 
@@ -11444,6 +11452,19 @@ bool StorageReplicatedMergeTree::createEmptyPartInsteadOfLost(zkutil::ZooKeeperP
             const auto & source_part = *parts_in_partition.begin();
             partition = source_part->partition;
             metadata_snapshot = source_part->getMetadataSnapshot();
+
+            if (source_part->info.isPatch())
+                patch_part_index = source_part->getPatchPartIndex().cloneEmpty();
+        }
+        else if (new_part_info.isPatch())
+        {
+            /// Metadata of a patch part (its columns and patch part index) can be taken only from a sibling
+            /// patch part. The partition id stores only a hash of the patch column names, so it cannot be
+            /// used to reconstruct them.
+            LOG_WARNING(log, "Empty part {} is not created instead of lost patch part because there are no active parts "
+                             "in patch partition {}, resolve this manually using DROP/DETACH PARTITION.",
+                        lost_part_name, new_part_info.getPartitionId());
+            return false;
         }
         else if (auto parsed_partition = MergeTreePartition::tryParseValueFromID(
                      new_part_info.getPartitionId(),
@@ -11459,7 +11480,7 @@ bool StorageReplicatedMergeTree::createEmptyPartInsteadOfLost(zkutil::ZooKeeperP
         }
     }
 
-    auto [new_data_part, tmp_dir_holder] = createEmptyPart(new_part_info, partition, lost_part_name, metadata_snapshot, NO_TRANSACTION_PTR);
+    auto [new_data_part, tmp_dir_holder] = createEmptyPart(new_part_info, partition, lost_part_name, metadata_snapshot, NO_TRANSACTION_PTR, std::move(patch_part_index));
     new_data_part->setName(lost_part_name);
 
     try

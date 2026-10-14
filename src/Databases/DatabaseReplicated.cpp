@@ -46,6 +46,7 @@
 #include <Processors/Sinks/EmptySink.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/StorageKeeperMap.h>
+#include <Storages/StorageProxy.h>
 #include <base/chrono_io.h>
 #include <base/defines.h>
 #include <base/getFQDNOrHostName.h>
@@ -2903,7 +2904,7 @@ bool DatabaseReplicated::shouldReplicateQuery(const ContextPtr & query_context, 
         auto table_id = query_context->resolveStorageID(ast, Context::ResolveOrdinary);
         StoragePtr table = DatabaseCatalog::instance().getTable(table_id, query_context);
 
-        return table->as<StorageKeeperMap>() != nullptr;
+        return castStorage<StorageKeeperMap>(table, DeferredTable::Load) != nullptr;
     };
 
     const auto is_replicated_table = [&](const ASTPtr & ast)
@@ -2927,7 +2928,7 @@ bool DatabaseReplicated::shouldReplicateQuery(const ContextPtr & query_context, 
     if (const auto * alter = query_ptr->as<const ASTAlterQuery>())
     {
         if (alter->isAttachAlter() || alter->isFetchAlter() || alter->isDropPartitionAlter() || alter->isFreezeAlter()
-            || alter->isUnlockSnapshot() || alter->isReplacePartitionAlter())
+            || alter->isUnlockSnapshot())
             return false;
 
         // Allowed ALTER operation on KeeperMap still should be replicated

@@ -24,6 +24,7 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/Optimizations/keyTypeBreaksHashSharding.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/UnionStep.h>
 #include <Processors/QueryPlan/DistinctStep.h>
@@ -63,6 +64,7 @@
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/StorageMerge.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageView.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
@@ -172,6 +174,7 @@ namespace Setting
     extern const SettingsBool enable_adaptive_aggregator;
     extern const SettingsUInt64 adaptive_aggregator_freeze_threshold;
     extern const SettingsUInt64 adaptive_aggregator_freeze_threshold_bytes;
+    extern const SettingsBool use_aggregation_memory_tracker;
     extern const SettingsUInt64 max_bytes_to_transfer;
     extern const SettingsUInt64 max_rows_to_transfer;
     extern const SettingsOverflowMode transfer_overflow_mode;
@@ -256,17 +259,27 @@ void checkStoragesSupportTransactions(const PlannerContextPtr & planner_context)
 FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & query_tree, const TableExpressionNodes & table_nodes, const ContextPtr & query_context, const ActionsDAG * post_filter)
 {
     bool collect_filters = false;
-    const auto & settings = query_context->getSettingsRef();
 
-    bool parallel_replicas_estimation_enabled
-        = query_context->canUseParallelReplicasOnInitiator() && settings[Setting::parallel_replicas_min_number_of_rows_per_replica] > 0;
+    /// `table_nodes` also holds the nested query and union scopes, and the settings may be set only in one
+    /// of them, so the top-level context alone is not enough to tell whether the estimation will run.
+    const bool parallel_replicas_estimation_enabled = std::ranges::any_of(table_nodes, [](const TableExpressionNodePtr & scope)
+    {
+        const auto * scope_query = scope->as<QueryNode>();
+        const auto * scope_union = scope->as<UnionNode>();
+        if (!scope_query && !scope_union)
+            return false;
+
+        const auto & scope_context = scope_query ? scope_query->getContext() : scope_union->getContext();
+        return scope_context->canUseParallelReplicasOnInitiator()
+            && scope_context->getSettingsRef()[Setting::parallel_replicas_min_number_of_rows_per_replica] > 0;
+    });
 
     auto storage_requires_filter_collection = [parallel_replicas_estimation_enabled](const StoragePtr & storage_ptr)
     {
         const auto * raw = storage_ptr.get();
         if (typeid_cast<const StorageDistributed *>(raw))
             return true;
-        if (parallel_replicas_estimation_enabled && std::dynamic_pointer_cast<MergeTreeData>(storage_ptr))
+        if (parallel_replicas_estimation_enabled && castStorage<MergeTreeData>(storage_ptr, DeferredTable::Load))
             return true;
         if (typeid_cast<const StorageObjectStorageCluster *>(raw))
             return true;
@@ -692,7 +705,8 @@ Aggregator::Params getAggregatorParams(const PlannerContextPtr & planner_context
         settings[Setting::enable_packed_string_keys_in_aggregation],
         settings[Setting::enable_adaptive_aggregator],
         settings[Setting::adaptive_aggregator_freeze_threshold],
-        settings[Setting::adaptive_aggregator_freeze_threshold_bytes]);
+        settings[Setting::adaptive_aggregator_freeze_threshold_bytes],
+        settings[Setting::use_aggregation_memory_tracker]);
 
     return aggregator_params;
 }
@@ -1362,6 +1376,9 @@ void addWithFillStepIfNeeded(QueryPlan & query_plan,
         {
             ActionsDAG rename_dag;
 
+            /// A later item resolves names against every node of the DAG, so the conversions and outputs are added after all items are visited.
+            std::vector<std::tuple<const ActionsDAG::Node *, DataTypePtr, String>> interpolated_columns;
+
             for (auto & interpolate_node : interpolate_list_nodes)
             {
                 auto & interpolate_node_typed = interpolate_node->as<InterpolateNode &>();
@@ -1382,16 +1399,16 @@ void addWithFillStepIfNeeded(QueryPlan & query_plan,
 
                 const auto * expression_to_interpolate = expression_to_interpolate_expression_nodes[0];
                 const auto * interpolate_expression = interpolate_expression_nodes[0];
-                if (!interpolate_expression->result_type->equals(*expression_to_interpolate->result_type))
-                {
-                    interpolate_expression = &interpolate_actions_dag.addCast(*interpolate_expression,
-                        expression_to_interpolate->result_type,
-                        interpolate_expression->result_name,
-                        planner_context->getQueryContext());
-                }
+                interpolated_columns.emplace_back(interpolate_expression, expression_to_interpolate->result_type, interpolate_node_typed.getExpressionName());
+            }
 
-                const auto * alias_node = &interpolate_actions_dag.addAlias(*interpolate_expression, interpolate_node_typed.getExpressionName());
-                interpolate_actions_dag.getOutputs().push_back(alias_node);
+            for (const auto & [interpolate_expression, target_type, target_name] : interpolated_columns)
+            {
+                const auto * interpolated_column = interpolate_expression;
+                if (!interpolated_column->result_type->equals(*target_type))
+                    interpolated_column = &interpolate_actions_dag.addCast(*interpolated_column, target_type, {}, planner_context->getQueryContext());
+
+                interpolate_actions_dag.getOutputs().push_back(&interpolate_actions_dag.addAlias(*interpolated_column, target_name));
             }
 
             if (!rename_dag.getOutputs().empty())
@@ -1735,10 +1752,26 @@ void addWindowSteps(QueryPlan & query_plan,
             /// would produce incomplete data and cause the pipeline to get stuck.
             sort_settings.size_limits.overflow_mode = OverflowMode::THROW;
 
+            /// The sort scatters rows across threads by the hash of the partition columns it is given,
+            /// but `WindowTransform` finds partition boundaries with `compareAt`. For key types where
+            /// the two disagree the scatter would split one logical partition across threads, so such
+            /// windows sort in a single merged stream instead.
+            SortDescription scatter_partition_by = window_description.partition_by;
+            const auto & sort_input_header = query_plan.getCurrentHeader();
+            for (const auto & partition_column : window_description.partition_by)
+            {
+                if (QueryPlanOptimizations::keyTypeBreaksHashSharding(
+                        *sort_input_header->getByName(partition_column.column_name).type))
+                {
+                    scatter_partition_by.clear();
+                    break;
+                }
+            }
+
             auto sorting_step = std::make_unique<SortingStep>(
                 query_plan.getCurrentHeader(),
                 window_description.full_sort_description,
-                window_description.partition_by,
+                scatter_partition_by,
                 0 /*limit*/,
                 sort_settings);
             sorting_step->setStepDescription("Sorting for window '" + window_description.window_name + "'", max_step_description_length);
@@ -2093,6 +2126,9 @@ void addBuildSubqueriesForMaterializedCTEsIfNeeded(
                         materialized_cte->cte_name);
 
                 auto cte_options = select_query_options.subquery();
+                /// Gates for a materialized CTE belong to the plan that collected it, where a deeper
+                /// level yields a higher and therefore dominating gate; this CTE's plan is not that plan.
+                cte_options.forceMaterializeCTE(false);
                 Planner cte_planner(
                     cte_subquery,
                     cte_options,
@@ -2643,9 +2679,12 @@ void Planner::buildPlanForQueryNode()
     /// applied later as a plan transformation (QueryPlanOptimizations::applyParallelReplicas). So skip the
     /// old parallel-replicas planning path here (it would emit ReadFromLocalReplica /
     /// ReadFromRemoteParallelReplicas, e.g. inside a view/union inner query) and use the normal plan.
+    /// Same for a plan that is shipped to a shard: those steps are local to the server that planned
+    /// them and have no serialized form, and the shard decides on parallel replicas on its own.
     if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node
-        && !settings[Setting::parallel_replicas_plan_based])
+        && !settings[Setting::parallel_replicas_plan_based]
+        && !select_query_options.build_logical_plan)
     {
         join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);
     }

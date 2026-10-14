@@ -7,6 +7,9 @@
 #include <optional>
 #include <unordered_set>
 
+#include <base/arithmeticOverflow.h>
+
+#include <Interpreters/Context.h>
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -15,12 +18,15 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
+#include <Core/DecimalFunctions.h>
+#include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/String.h>
 #include <Storages/ColumnsDescription.h>
 #include <Parsers/ASTFunction.h>
+#include <Common/FieldAccurateComparison.h>
 #include <Common/quoteString.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <IO/ReadBufferFromString.h>
@@ -36,6 +42,11 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace DB::Setting
+{
+    extern const SettingsBool iceberg_tolerate_conflicting_manifest_schemas;
+}
+
 namespace ProfileEvents
 {
 extern const Event IcebergPartitionPrunedFiles;
@@ -49,70 +60,118 @@ using namespace DB;
 
 namespace
 {
+    /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
+    /// using the minimum number of bytes for the value
+    /// Our decimal binary representation is little endian
+    /// so we cannot reuse our default code for parsing it.
+    ///
+    /// NOTE: It's very weird, but Decimal values for lower bound and upper bound
+    /// are stored rounded, without fractional part. What is more strange
+    /// the integer part is rounded mathematically correctly according to fractional part.
+    /// Example: 17.22 -> 17, 8888.999 -> 8889, 1423.77 -> 1424.
+    /// I've checked two implementations: Spark and Amazon Athena and both of them
+    /// do this.
+    ///
+    /// The problem is -- we cannot use rounded values for lower bounds and upper bounds.
+    /// Example: upper_bound(x) = 17.22, but it's rounded 17.00, now condition WHERE x >= 17.21 will
+    /// check rounded value and say: "Oh largest value is 17, so values bigger than 17.21 cannot be in this file,
+    /// let's skip it". But it will produce incorrect result since actual value (17.22 >= 17.21) is stored in this file.
+    ///
+    /// To handle this issue we subtract 1 from the integral part for lower_bound and add 1 to integral
+    /// part of upper_bound. This produces: 17.22 -> [16.0, 18.0]. So this is more rough boundary,
+    /// but at least it doesn't lead to incorrect results.
+    /// `compensate_rounding` widens the bound as described above; pass false to read the value exactly
+    /// as the manifest declares it.
+    template <typename DecimalType>
+    std::optional<DB::Field>
+    deserializeDecimalBound(const std::string & str, UInt32 scale, bool lower_bound, bool compensate_rounding = true)
+    {
+        using NativeType = typename DecimalType::NativeType;
+        using UnsignedType = make_unsigned_t<NativeType>;
+
+        if (str.size() > sizeof(NativeType))
+            return std::nullopt;
+
+        /// Accumulate into the unsigned counterpart, pre-filled with the sign bits,
+        /// so that the sign extension comes out of the shifts themselves.
+        UnsignedType unscaled = (str[0] & 0x80) ? ~UnsignedType(0) : UnsignedType(0);
+        for (const auto byte : str)
+            unscaled = (unscaled << 8) | static_cast<UInt8>(byte);
+
+        NativeType unscaled_value = static_cast<NativeType>(unscaled);
+
+        if (compensate_rounding && scale)
+        {
+            /// Every value in the file fits the precision of the type it is read as, so the largest
+            /// magnitude that precision allows is on the outer side of all of them: it stands in for a
+            /// widened bound that leaves the type, and it is the tightest bound that does. Dropping the
+            /// bound instead would cost min/max pruning for the whole column.
+            const NativeType limit
+                = DecimalUtils::scaleMultiplier<NativeType>(DecimalUtils::max_precision<DecimalType>) - NativeType(1);
+
+            NativeType scaler = lower_bound ? -10 : 10;
+            for (UInt32 i = 1; i < scale; ++i)
+                scaler *= 10;
+
+            /// Widening can leave the type: a `Decimal(38, 38)` bound of magnitude above roughly 0.7
+            /// needs almost `2 * 10^38` while `Int128` holds `1.7 * 10^38`.
+            NativeType widened_value;
+            if (common::addOverflow(unscaled_value, scaler, widened_value))
+                widened_value = lower_bound ? -limit : limit;
+
+            /// A bound is stored as raw bytes that are never checked against a precision, so the
+            /// rounding the Iceberg writers apply can put it one unit outside the type: a file whose
+            /// extreme value is `0.99` carries `1.0` (`10^38` unscaled) at scale 38. Saturating such a
+            /// bound keeps it outside every value in the file, where rejecting it loses the column's
+            /// pruning. Saturation is monotonic, so it cannot invert a pair that was not inverted.
+            ///
+            /// Only the outer side saturates: a lower bound above the largest value the type holds (or an
+            /// upper bound below the smallest) is on the inner side of every value in the file, and
+            /// clamping it would collapse the range to a single point that excludes the data. Such a
+            /// bound is not a usable range border.
+            if (lower_bound)
+            {
+                if (widened_value > limit)
+                    return std::nullopt;
+                if (widened_value < -limit)
+                    widened_value = -limit;
+            }
+            else
+            {
+                if (widened_value < -limit)
+                    return std::nullopt;
+                if (widened_value > limit)
+                    widened_value = limit;
+            }
+
+            unscaled_value = widened_value;
+        }
+
+        return DB::DecimalField<DecimalType>(unscaled_value, scale);
+    }
+
     /// Iceberg stores lower_bounds and upper_bounds serialized with some custom deserialization as bytes array
     /// https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
-    std::optional<DB::Field> deserializeFieldFromBinaryRepr(std::string str, DB::DataTypePtr expected_type, bool lower_bound)
+    std::optional<DB::Field> deserializeFieldFromBinaryRepr(
+        std::string str, DB::DataTypePtr expected_type, bool lower_bound, bool compensate_rounding = true)
     {
         auto non_nullable_type = DB::removeNullable(expected_type);
         auto column = non_nullable_type->createColumn();
         if (DB::WhichDataType(non_nullable_type).isDecimal())
         {
-            /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
-            /// using the minimum number of bytes for the value
-            /// Our decimal binary representation is little endian
-            /// so we cannot reuse our default code for parsing it.
-            int64_t unscaled_value = 0;
-
-            // Convert from big-endian to signed int
-            for (const auto byte : str)
-                unscaled_value = (unscaled_value << 8) | static_cast<uint8_t>(byte);
-
-            /// Add sign
-            if (str[0] & 0x80)
-            {
-                int64_t sign_extension = -1;
-                sign_extension <<= (str.size() * 8);
-                unscaled_value |= sign_extension;
-            }
-
-            /// NOTE: It's very weird, but Decimal values for lower bound and upper bound
-            /// are stored rounded, without fractional part. What is more strange
-            /// the integer part is rounded mathematically correctly according to fractional part.
-            /// Example: 17.22 -> 17, 8888.999 -> 8889, 1423.77 -> 1424.
-            /// I've checked two implementations: Spark and Amazon Athena and both of them
-            /// do this.
-            ///
-            /// The problem is -- we cannot use rounded values for lower bounds and upper bounds.
-            /// Example: upper_bound(x) = 17.22, but it's rounded 17.00, now condition WHERE x >= 17.21 will
-            /// check rounded value and say: "Oh largest value is 17, so values bigger than 17.21 cannot be in this file,
-            /// let's skip it". But it will produce incorrect result since actual value (17.22 >= 17.21) is stored in this file.
-            ///
-            /// To handle this issue we subtract 1 from the integral part for lower_bound and add 1 to integral
-            /// part of upper_bound. This produces: 17.22 -> [16.0, 18.0]. So this is more rough boundary,
-            /// but at least it doesn't lead to incorrect results.
-            if (int32_t scale = DB::getDecimalScale(*non_nullable_type))
-            {
-                int64_t scaler = lower_bound ? -10 : 10;
-                while (--scale)
-                    scaler *= 10;
-
-                unscaled_value += scaler;
-            }
-
-            if (const auto * decimal_type = DB::checkDecimal<DB::Decimal32>(*non_nullable_type))
-            {
-                DB::DecimalField<DB::Decimal32> result(static_cast<Int32>(unscaled_value), decimal_type->getScale());
-                return result;
-            }
-            if (const auto * decimal_type = DB::checkDecimal<DB::Decimal64>(*non_nullable_type))
-            {
-                DB::DecimalField<DB::Decimal64> result(unscaled_value, decimal_type->getScale());
-                return result;
-            }
-            else
-            {
+            if (str.empty())
                 return std::nullopt;
-            }
+
+            const UInt32 scale = DB::getDecimalScale(*non_nullable_type);
+            if (DB::checkDecimal<DB::Decimal32>(*non_nullable_type))
+                return deserializeDecimalBound<DB::Decimal32>(str, scale, lower_bound, compensate_rounding);
+            if (DB::checkDecimal<DB::Decimal64>(*non_nullable_type))
+                return deserializeDecimalBound<DB::Decimal64>(str, scale, lower_bound, compensate_rounding);
+            if (DB::checkDecimal<DB::Decimal128>(*non_nullable_type))
+                return deserializeDecimalBound<DB::Decimal128>(str, scale, lower_bound, compensate_rounding);
+            if (DB::checkDecimal<DB::Decimal256>(*non_nullable_type))
+                return deserializeDecimalBound<DB::Decimal256>(str, scale, lower_bound, compensate_rounding);
+            return std::nullopt;
         }
         else if (non_nullable_type->getTypeId() == DB::TypeIndex::Variant)
         {
@@ -251,7 +310,8 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     Int64 inherited_snapshot_id_,
     DB::ContextPtr context_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
-    Int32 table_snapshot_schema_id_)
+    Int32 table_snapshot_schema_id_,
+    const std::atomic<bool> * stop_flag_)
 {
     insertRowToLogTable(
         context_,
@@ -298,11 +358,38 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             path_to_manifest_file_,
             f_schema);
 
-    Poco::Dynamic::Var json = parser.parse(*schema_json_string);
-    const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
-    Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
+    const bool tolerate_conflicting_manifest_schemas = context_->getSettingsRef()[Setting::iceberg_tolerate_conflicting_manifest_schemas];
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    std::optional<Int32> header_schema_id;
+    if (auto schema_id_string = manifest_file_deserializer_->tryGetAvroMetadataValue(f_schema_id))
+        header_schema_id = parse<Int32>(*schema_id_string);
+
+    Int32 manifest_schema_id = 0;
+    if (header_schema_id.has_value() && tolerate_conflicting_manifest_schemas
+        && schema_processor.isSchemaRegisteredFromMetadata(*header_schema_id))
+    {
+        manifest_schema_id = *header_schema_id;
+    }
+    else
+    {
+        Poco::Dynamic::Var json = parser.parse(*schema_json_string);
+        const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
+        Int32 embedded_schema_id = schema_object->getValue<int>(f_schema_id);
+        if (header_schema_id.has_value() && *header_schema_id != embedded_schema_id)
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Manifest file '{}' has header key '{}' = {} that differs from the '{}' = {} of its '{}' header",
+                path_to_manifest_file_,
+                f_schema_id,
+                *header_schema_id,
+                f_schema_id,
+                embedded_schema_id,
+                f_schema);
+        manifest_schema_id = embedded_schema_id;
+
+        schema_processor.addIcebergTableSchema(
+            schema_object, IcebergSchemaProcessor::SchemaSource::ManifestFile, tolerate_conflicting_manifest_schemas);
+    }
 
     PartitionSpecification partition_spec_vec;
     for (size_t i = 0; i != partition_specification->size(); ++i)
@@ -319,7 +406,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             continue;
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name);
+        partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
@@ -354,7 +441,8 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         std::move(partition_key_description),
         total_rows,
         std::move(filter_dag_),
-        table_snapshot_schema_id_));
+        table_snapshot_schema_id_,
+        stop_flag_));
 }
 
 ManifestFileIterator::ManifestFileIterator(
@@ -371,7 +459,8 @@ ManifestFileIterator::ManifestFileIterator(
     std::optional<DB::KeyDescription> partition_key_description_,
     size_t total_rows_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
-    Int32 table_snapshot_schema_id_)
+    Int32 table_snapshot_schema_id_,
+    const std::atomic<bool> * stop_flag_)
     : manifest_file_deserializer(std::move(manifest_file_deserializer_))
     , path_to_manifest_file(path_to_manifest_file_)
     , format_version(format_version_)
@@ -384,6 +473,7 @@ ManifestFileIterator::ManifestFileIterator(
     , partition_key_description(std::move(partition_key_description_))
     , table_snapshot_schema_id(table_snapshot_schema_id_)
     , total_rows(total_rows_)
+    , stop_flag(stop_flag_)
     , data_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
     , position_deletes_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
     , equality_deletes_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
@@ -444,13 +534,14 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         /// those manifests still carry the original snapshot_id. The manifest file's own Avro header
         /// records the correct schema_id for the data files it describes, so falling back to
         /// manifest_schema_id is safe and correct in this case.
-        LOG_DEBUG(
-            getLogger("ManifestFileIterator"),
-            "Manifest file '{}' has entry with snapshot_id '{}' whose snapshot metadata is not present "
-            "(snapshot may have been expired by the catalog). Falling back to manifest schema_id {}.",
-            path_to_manifest_file,
-            resolved_snapshot_id,
-            manifest_schema_id);
+        if (!logged_missing_snapshot_metadata.exchange(true, std::memory_order_relaxed))
+            LOG_TEST(
+                getLogger("ManifestFileIterator"),
+                "Manifest file '{}' has entry with snapshot_id '{}' whose snapshot metadata is not present "
+                "(snapshot may have been expired by the catalog). Falling back to manifest schema_id {}.",
+                path_to_manifest_file,
+                resolved_snapshot_id,
+                manifest_schema_id);
     }
     const auto resolved_schema_id = schema_id_opt.has_value() ? *schema_id_opt : manifest_schema_id;
 
@@ -480,20 +571,18 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     PruningReturnStatus pruning_status = PruningReturnStatus::NOT_PRUNED;
     if (filter_dag)
     {
+        const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
+
         /// Compute per-column hyperrectangles for DATA files
         std::unordered_map<Int32, DB::Range> hyperrectangles;
         if (parsed_entry->content_type == FileContentType::DATA)
         {
-            for (const auto & [column_id, bounds] : parsed_entry->value_bounds)
+            for (const auto & [column_id, column_type] : current_pruner->getMinMaxColumnTypes())
             {
-                auto field_characteristics = schema_processor_ptr->tryGetFieldCharacteristics(resolved_schema_id, column_id);
-                /// If we don't have column characteristics, bounds don't have any sense.
-                /// This happens if the subfield is inside map or array, because we don't support
-                /// name generation for such subfields (we support names of nested subfields in structs only).
-                if (!field_characteristics)
+                auto bounds_it = parsed_entry->value_bounds.find(column_id);
+                if (bounds_it == parsed_entry->value_bounds.end())
                     continue;
-
-                const auto & name_and_type = *field_characteristics;
+                const auto & bounds = bounds_it->second;
 
                 String left_str;
                 String right_str;
@@ -501,21 +590,60 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                 if (!bounds.first.tryGet(left_str) || !bounds.second.tryGet(right_str))
                     continue;
 
-                if (const auto type_id = name_and_type.type->getTypeId();
+                if (const auto type_id = column_type->getTypeId();
                     type_id == DB::TypeIndex::Tuple || type_id == DB::TypeIndex::Map || type_id == DB::TypeIndex::Array
                     || type_id == DB::TypeIndex::Variant)
                     continue;
 
-                auto left = deserializeFieldFromBinaryRepr(left_str, name_and_type.type, true);
-                auto right = deserializeFieldFromBinaryRepr(right_str, name_and_type.type, false);
+                auto left = deserializeFieldFromBinaryRepr(left_str, column_type, true);
+                auto right = deserializeFieldFromBinaryRepr(right_str, column_type, false);
                 if (!left || !right)
+                {
+                    /// A bound that does not decode is wider than the storage of its type, or a decimal
+                    /// bound beyond the precision of its type on the inner side of the range. Pruning is
+                    /// skipped either way, so this stays out of the warning log.
+                    LOG_DEBUG(
+                        getLogger("ManifestFileIterator"),
+                        "Manifest file '{}' declares a bound that cannot be read as a usable range border "
+                        "for column id {} of data file '{}'; skipping min/max pruning for this column",
+                        path_to_manifest_file,
+                        column_id,
+                        parsed_entry->file_path_key.serialize());
                     continue;
+                }
+
+                /// At a non-zero scale the outward shift moves each decimal bound one integral unit, so it
+                /// un-inverts any declared pair no more than `2 * 10^scale` apart. Only the values as
+                /// declared expose that inversion, which is why they are read again here.
+                std::optional<DB::Field> declared_left = left;
+                std::optional<DB::Field> declared_right = right;
+                if (DB::WhichDataType(DB::removeNullable(column_type)).isDecimal())
+                {
+                    declared_left = deserializeFieldFromBinaryRepr(
+                        left_str, column_type, true, /*compensate_rounding=*/false);
+                    declared_right = deserializeFieldFromBinaryRepr(
+                        right_str, column_type, false, /*compensate_rounding=*/false);
+                }
+
+                /// A pair inverted as declared means the manifest's statistics are untrustworthy, so no
+                /// range derived from them is safe to prune on. Dropping the column's bounds is therefore
+                /// right where swapping or clamping them would prune on a value nothing vouches for.
+                if (accurateLess(*declared_right, *declared_left))
+                {
+                    LOG_WARNING(
+                        getLogger("ManifestFileIterator"),
+                        "Manifest file '{}' declares a lower bound above the upper bound for column id "
+                        "{} of data file '{}'; skipping min/max pruning for this column",
+                        path_to_manifest_file,
+                        column_id,
+                        parsed_entry->file_path_key.serialize());
+                    continue;
+                }
 
                 hyperrectangles.emplace(column_id, DB::Range(*left, true, *right, true));
             }
         }
 
-        const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
         pruning_status = current_pruner->canBePruned(entry, hyperrectangles);
     }
     insertRowToLogTable(
@@ -593,6 +721,11 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::next()
             fully_initialized.store(true);
             return nullptr;
         }
+        /// The data manifest decode tasks pass the stream's stopped flag here, so a cancelled
+        /// query stops decoding mid-manifest. Checked between rows rather than by the caller,
+        /// because a long stretch of pruned rows yields nothing the caller could check on.
+        if (stop_flag && stop_flag->load(std::memory_order_relaxed))
+            return nullptr;
         auto entry = processRow(row_index);
         if (entry)
             return entry;
