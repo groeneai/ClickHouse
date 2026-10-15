@@ -11,6 +11,7 @@
 #include <Storages/MergeTree/MergeTreeIndexConditionText.h>
 #include <Storages/MergeTree/MergeTreeIndexTextPreprocessor.h>
 #include <Storages/MergeTree/MergeTreeIndexTextPostprocessor.h>
+#include <Storages/MergeTree/RPNBuilder.h>
 #include <Storages/MergeTree/TextIndexUtils.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -201,6 +202,15 @@ void MergeTreeReaderTextIndex::initializeFallbackReader(const IMergeTreeReader *
         dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
         auto actions = std::make_shared<ExpressionActions>(
             std::move(*dag), ExpressionActionsSettings(context_copy->getSettingsRef()));
+
+        /// The query may convert the column, e.g. `CAST(s, 'String')` over a `LowCardinality(String)` column,
+        /// and the converted copy is a full column of the evaluated rows.
+        if (std::ranges::any_of(actions->getActions(), [](const auto & action)
+            {
+                return isLosslessConversionFunction(*action.node)
+                    && action.node->children.front()->type == ActionsDAG::ActionType::INPUT;
+            }))
+            evaluate_fallback_per_read = false;
 
         /// Collect the physical columns this expression requires.
         for (const auto & req : actions->getRequiredColumnsWithTypes())
