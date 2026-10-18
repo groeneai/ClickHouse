@@ -274,6 +274,8 @@ bool ConditionSelectivityEstimator::extractAtomFromTree(const StorageMetadataPtr
     Field const_value;
     DataTypePtr const_type;
     String column_name;
+    /// Set when the right-hand side of IN / NOT IN is a prepared set.
+    SetPtr set_for_ranges;
     DataTypePtr column_type;
 
     if (node.isFunction())
@@ -379,6 +381,7 @@ bool ConditionSelectivityEstimator::extractAtomFromTree(const StorageMetadataPtr
                     return false;
                 }
 
+                set_for_ranges = prepared_set;
                 Tuple tuple(columns[0]->size());
                 for (size_t i = 0; i < columns[0]->size(); ++i)
                     tuple[i] = (*columns[0])[i];
