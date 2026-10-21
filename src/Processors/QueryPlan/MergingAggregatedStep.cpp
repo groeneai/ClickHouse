@@ -22,7 +22,7 @@ namespace QueryPlanSerializationSetting
 {
     extern const QueryPlanSerializationSettingsUInt64 aggregation_in_order_max_block_bytes;
     extern const QueryPlanSerializationSettingsBool collect_hash_table_stats_during_aggregation;
-    extern const QueryPlanSerializationSettingsNonZeroUInt64 max_block_size;
+    extern const QueryPlanSerializationSettingsUInt64 max_block_size;
     extern const QueryPlanSerializationSettingsUInt64 max_entries_for_hash_table_stats;
     extern const QueryPlanSerializationSettingsUInt64 max_size_to_preallocate_for_aggregation;
     extern const QueryPlanSerializationSettingsFloat min_hit_rate_to_use_consecutive_keys_optimization;
@@ -209,22 +209,12 @@ void MergingAggregatedStep::updateOutputHeader()
 
 QueryPlanStepPtr MergingAggregatedStep::clone() const
 {
-    return cloneImpl(memory_efficient_aggregation);
-}
-
-QueryPlanStepPtr MergingAggregatedStep::cloneWithoutMemoryEfficientAggregation() const
-{
-    return cloneImpl(false);
-}
-
-std::unique_ptr<MergingAggregatedStep> MergingAggregatedStep::cloneImpl(bool memory_efficient_aggregation_) const
-{
     auto cloned = std::make_unique<MergingAggregatedStep>(
         input_headers.front(),
         params,
         grouping_sets_params,
         final,
-        memory_efficient_aggregation_,
+        memory_efficient_aggregation,
         memory_efficient_merge_threads,
         should_produce_results_in_order_of_bucket_number,
         max_block_size,
@@ -297,7 +287,7 @@ void MergingAggregatedStep::serialize(Serialization & ctx) const
 
     writeVarUInt(params.keys.size(), ctx.out);
     for (const auto & key : params.keys)
-        ctx.writeColumnName(key);
+        writeStringBinary(key, ctx.out);
 
     if (!grouping_sets_params.empty())
     {
@@ -307,13 +297,13 @@ void MergingAggregatedStep::serialize(Serialization & ctx) const
             /// Only used keys are needed.
             writeVarUInt(grouping_set.used_keys.size(), ctx.out);
             for (const auto & used_key : grouping_set.used_keys)
-                ctx.writeColumnName(used_key);
+                writeStringBinary(used_key, ctx.out);
         }
     }
 
-    serializeAggregateDescriptions(params.aggregates, ctx.out, ctx.for_cache_key, ctx.input_header);
+    serializeAggregateDescriptions(params.aggregates, ctx.out);
 
-    serializeSortDescription(group_by_sort_description, ctx.out, ctx.version, ctx.for_cache_key, ctx.input_header);
+    serializeSortDescription(group_by_sort_description, ctx.out, ctx.version);
 
     if (params.stats_collecting_params.isCollectionAndUseEnabled())
         writeIntBinary(params.stats_collecting_params.key, ctx.out);
