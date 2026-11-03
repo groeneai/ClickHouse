@@ -14,8 +14,7 @@ as_user()
     $CLICKHOUSE_CLIENT --user "$user_name" -q "$1" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 }
 
-# A table cannot be created as a MergeTree introspection function at all, so the arms that would
-# have persisted a source this user cannot see are refused before their grants are considered.
+# The arms below would persist a source this user cannot see, so they must be denied.
 as_user_create_as()
 {
     $CLICKHOUSE_CLIENT --user "$user_name" -q "$1" 2>&1 \
@@ -98,6 +97,7 @@ as_user_create_as "CREATE TABLE t_as_tf_ti AS mergeTreeTextIndex(currentDatabase
 
 echo "=== create as table function, no grants on the source ==="
 as_user_create_as "CREATE TABLE t_as_tf AS mergeTreeIndex(currentDatabase(), t_source_access)"
+as_user_create_as "CREATE TABLE t_as_tf_p (b UInt64) AS mergeTreeProjection(currentDatabase(), t_source_access, p_src)"
 
 $CLICKHOUSE_CLIENT -q "
 DROP TABLE IF EXISTS t_as_tf;

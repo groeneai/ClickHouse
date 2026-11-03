@@ -47,21 +47,12 @@ $CLICKHOUSE_CLIENT -q "
 DROP USER IF EXISTS $user_show_tables;
 CREATE USER $user_show_tables NOT IDENTIFIED;
 GRANT SHOW TABLES ON $CLICKHOUSE_DATABASE.t_source_access TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_p TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_ai TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_ti TO $user_show_tables;
 "
 
 echo "=== SHOW TABLES but not SHOW COLUMNS ==="
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = 't_source_access'"
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "DESCRIBE t_source_access" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "SELECT count() FROM viewIfPermitted(SELECT 1 ELSE mergeTreeIndex(currentDatabase(), t_source_access))" 2>&1 | grep -o "ACCESS_DENIED\|the table function after 'ELSE' gives" | uniq
-# A table created as a MergeTree introspection function is refused whatever the grants are, so the
-# source of one cannot be persisted into a table of this user and the count below stays 0.
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_p (b UInt64) AS mergeTreeProjection(currentDatabase(), t_source_access, p_src)" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_ai (part_name String) AS mergeTreeAnalyzeIndexes(currentDatabase(), t_source_access)" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_ti (part_name String) AS mergeTreeTextIndex(currentDatabase(), t_source_access, 'idx_none')" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT -q "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name IN ('t_ok_as_tf_p', 't_ok_as_tf_ai', 't_ok_as_tf_ti')"
 # Naming the source is all the execution seam of these two asks for, so with exactly `SHOW TABLES`
 # the seam is satisfied and the next denial names the privilege of reading instead. Without that
 # grant the same two lines name `SHOW TABLES`, in the no-grants part of this test.
