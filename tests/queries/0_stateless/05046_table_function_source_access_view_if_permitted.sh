@@ -32,6 +32,7 @@ ENGINE = MergeTree ORDER BY a SETTINGS min_bytes_for_wide_part = 0;
 INSERT INTO t_source_access SELECT number, number FROM numbers(100);
 
 CREATE TABLE t_not_mergetree (a UInt64) ENGINE = Log;
+SET allow_experimental_alias_table_engine = 1;
 CREATE TABLE t_alias_src ENGINE = Alias(currentDatabase(), 't_source_access');
 
 CREATE USER $user_name NOT IDENTIFIED;

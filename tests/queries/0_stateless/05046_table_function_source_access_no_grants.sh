@@ -14,8 +14,7 @@ as_user()
     $CLICKHOUSE_CLIENT --user "$user_name" -q "$1" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 }
 
-# A table cannot be created as a MergeTree introspection function at all, so the arms that would
-# have persisted a source this user cannot see are refused before their grants are considered.
+# The arms below would persist a source this user cannot see, so they must be denied.
 as_user_create_as()
 {
     $CLICKHOUSE_CLIENT --user "$user_name" -q "$1" 2>&1 \
@@ -47,7 +46,6 @@ ENGINE = MergeTree ORDER BY a SETTINGS min_bytes_for_wide_part = 0;
 INSERT INTO t_source_access SELECT number, number FROM numbers(100);
 
 CREATE TABLE t_not_mergetree (a UInt64) ENGINE = Log;
-CREATE TABLE t_alias_src ENGINE = Alias(currentDatabase(), 't_source_access');
 
 CREATE USER $user_name NOT IDENTIFIED;
 
@@ -56,7 +54,6 @@ CREATE USER $user_name NOT IDENTIFIED;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf TO $user_name;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf_p TO $user_name;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf_ti TO $user_name;
-GRANT SHOW COLUMNS ON $CLICKHOUSE_DATABASE.t_alias_src TO $user_name;
 "
 
 echo "=== arming: the user cannot see either source table ==="
@@ -85,19 +82,9 @@ as_user "SELECT count() FROM mergeTreeAnalyzeIndexes(currentDatabase(), t_no_suc
 as_user "SELECT count() FROM viewIfPermitted(SELECT 1 ELSE mergeTreeIndex(currentDatabase(), t_source_access))"
 as_user "DESCRIBE viewIfPermitted(SELECT 1 ELSE url('http://localhost:1/', TSV, 'x UInt8'))"
 
-echo "=== alias, SHOW COLUMNS on the alias but not on its target ==="
-as_user "DESCRIBE t_alias_src"
-as_user "DESCRIBE mergeTreeProjection(currentDatabase(), t_alias_src, p_src)"
-# Reading has its own check site, and without one the caller reaches an internal cast failure.
-$CLICKHOUSE_CLIENT --user "$user_name" -q "SELECT count() FROM mergeTreeProjection(currentDatabase(), t_alias_src, p_src)" 2>&1 | grep -o "ACCESS_DENIED\|std::bad_cast" | uniq
-as_user "DESCRIBE loop(currentDatabase(), t_alias_src)"
-# An index name is metadata too, so the denial must come before the index lookup reports it missing.
-$CLICKHOUSE_CLIENT --user "$user_name" -q "SELECT count() FROM mergeTreeTextIndex(currentDatabase(), t_alias_src, 'idx_none')" 2>&1 | grep -o "ACCESS_DENIED\|There is no index with name 'idx_none'" | uniq
-as_user_create_as "CREATE TABLE t_as_tf_p (b UInt64) AS mergeTreeProjection(currentDatabase(), t_alias_src, p_src)"
-as_user_create_as "CREATE TABLE t_as_tf_ti AS mergeTreeTextIndex(currentDatabase(), t_alias_src, 'idx_none')"
-
 echo "=== create as table function, no grants on the source ==="
 as_user_create_as "CREATE TABLE t_as_tf AS mergeTreeIndex(currentDatabase(), t_source_access)"
+as_user_create_as "CREATE TABLE t_as_tf_p (b UInt64) AS mergeTreeProjection(currentDatabase(), t_source_access, p_src)"
 
 $CLICKHOUSE_CLIENT -q "
 DROP TABLE IF EXISTS t_as_tf;

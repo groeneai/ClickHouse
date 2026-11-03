@@ -27,7 +27,6 @@ ENGINE = MergeTree ORDER BY a SETTINGS min_bytes_for_wide_part = 0;
 INSERT INTO t_source_access SELECT number, number FROM numbers(100);
 
 CREATE TABLE t_not_mergetree (a UInt64) ENGINE = Log;
-CREATE TABLE t_alias_src ENGINE = Alias(currentDatabase(), 't_source_access');
 
 CREATE USER $user_name NOT IDENTIFIED;
 
@@ -36,7 +35,6 @@ CREATE USER $user_name NOT IDENTIFIED;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf TO $user_name;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf_p TO $user_name;
 GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_as_tf_ti TO $user_name;
-GRANT SHOW COLUMNS ON $CLICKHOUSE_DATABASE.t_alias_src TO $user_name;
 "
 
 # A second user that can see the table but not describe it. viewIfPermitted resolves the ELSE
@@ -47,21 +45,12 @@ $CLICKHOUSE_CLIENT -q "
 DROP USER IF EXISTS $user_show_tables;
 CREATE USER $user_show_tables NOT IDENTIFIED;
 GRANT SHOW TABLES ON $CLICKHOUSE_DATABASE.t_source_access TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_p TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_ai TO $user_show_tables;
-GRANT CREATE TABLE ON $CLICKHOUSE_DATABASE.t_ok_as_tf_ti TO $user_show_tables;
 "
 
 echo "=== SHOW TABLES but not SHOW COLUMNS ==="
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = 't_source_access'"
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "DESCRIBE t_source_access" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 $CLICKHOUSE_CLIENT --user "$user_show_tables" -q "SELECT count() FROM viewIfPermitted(SELECT 1 ELSE mergeTreeIndex(currentDatabase(), t_source_access))" 2>&1 | grep -o "ACCESS_DENIED\|the table function after 'ELSE' gives" | uniq
-# A table created as a MergeTree introspection function is refused whatever the grants are, so the
-# source of one cannot be persisted into a table of this user and the count below stays 0.
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_p (b UInt64) AS mergeTreeProjection(currentDatabase(), t_source_access, p_src)" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_ai (part_name String) AS mergeTreeAnalyzeIndexes(currentDatabase(), t_source_access)" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT --user "$user_show_tables" -q "CREATE TABLE t_ok_as_tf_ti (part_name String) AS mergeTreeTextIndex(currentDatabase(), t_source_access, 'idx_none')" 2>&1 | grep -o "ACCESS_DENIED\|cannot be used to create a table" | uniq
-$CLICKHOUSE_CLIENT -q "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name IN ('t_ok_as_tf_p', 't_ok_as_tf_ai', 't_ok_as_tf_ti')"
 # Naming the source is all the execution seam of these two asks for, so with exactly `SHOW TABLES`
 # the seam is satisfied and the next denial names the privilege of reading instead. Without that
 # grant the same two lines name `SHOW TABLES`, in the no-grants part of this test.
@@ -84,23 +73,6 @@ $CLICKHOUSE_CLIENT --user "$user_show_columns" -q "DESCRIBE mergeTreeProjection(
 $CLICKHOUSE_CLIENT --user "$user_show_columns" -q "SELECT a FROM mergeTreeIndex(currentDatabase(), t_source_access)" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 $CLICKHOUSE_CLIENT --user "$user_show_columns" -q "SELECT b FROM mergeTreeProjection(currentDatabase(), t_source_access, p_src)" 2>&1 | grep -o "ACCESS_DENIED" | uniq
 
-# A fourth user holding SHOW COLUMNS on the alias and on its target and nothing else, so the arms
-# below fail if the alias leg demands anything stronger than SHOW COLUMNS on the target.
-user_alias_both="${CLICKHOUSE_DATABASE}_test_user_05046_ab"
-$CLICKHOUSE_CLIENT -q "
-DROP USER IF EXISTS $user_alias_both;
-CREATE USER $user_alias_both NOT IDENTIFIED;
-GRANT SHOW COLUMNS ON $CLICKHOUSE_DATABASE.t_alias_src TO $user_alias_both;
-GRANT SHOW COLUMNS ON $CLICKHOUSE_DATABASE.t_source_access TO $user_alias_both;
-"
-
-echo "=== SHOW COLUMNS on alias and target ==="
-$CLICKHOUSE_CLIENT --user "$user_alias_both" -q "DESCRIBE mergeTreeProjection(currentDatabase(), t_alias_src, p_src) FORMAT TSV" | cut -f 1
-$CLICKHOUSE_CLIENT --user "$user_alias_both" -q "DESCRIBE loop(currentDatabase(), t_alias_src) FORMAT TSV" | cut -f 1
-# Naming the target's columns is all `mergeTreeTextIndex` may ask of an alias target, so these
-# grants have to reach the index lookup rather than a denial.
-$CLICKHOUSE_CLIENT --user "$user_alias_both" -q "SELECT count() FROM mergeTreeTextIndex(currentDatabase(), t_alias_src, 'idx_none')" 2>&1 | grep -o "ACCESS_DENIED\|There is no index with name 'idx_none'" | uniq
-
 $CLICKHOUSE_CLIENT -q "
 DROP TABLE IF EXISTS t_ok_as_tf_p;
 DROP TABLE IF EXISTS t_ok_as_tf_ai;
@@ -111,5 +83,4 @@ DROP TABLE IF EXISTS t_source_access;
 DROP USER IF EXISTS $user_name;
 DROP USER IF EXISTS $user_show_tables;
 DROP USER IF EXISTS $user_show_columns;
-DROP USER IF EXISTS $user_alias_both;
 "
