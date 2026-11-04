@@ -4,6 +4,8 @@
 #include <Common/VectorWithMemoryTracking.h>
 #include <Core/Types.h>
 #include <IO/ConnectionTimeouts.h>
+#include <IO/HTTPHeaderEntries.h>
+#include <Interpreters/Context_fwd.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <memory>
@@ -132,6 +134,9 @@ struct AIEmbeddingResponse
 
     /// Number of tokens in the input, as reported by the provider. Used for quota tracking.
     UInt64 input_tokens = 0;
+
+    /// Always 0: embedding endpoints produce no output tokens.
+    static constexpr UInt64 output_tokens = 0;
 };
 
 /** Abstract interface for AI provider HTTP clients.
@@ -145,22 +150,25 @@ class IAIProvider
 public:
     virtual ~IAIProvider() = default;
 
-    /// Send a chat completion request. Replaces the contents of `response`, filling the token counts
-    /// before the payload is validated: so a failed request can still update token counts.
-    virtual void call(const AIChatRequest & ai_request, const ConnectionTimeouts & timeouts, AIResponse & response) = 0;
+    /// Send a chat completion request and return the parsed response.
+    virtual AIResponse call(const AIChatRequest & ai_request, const ConnectionTimeouts & timeouts) = 0;
+
+    /// Provider-specific headers (credentials, API version) sent with every request.
+    virtual HTTPHeaderEntries getHeaders() const = 0;
 
     /// Whether this provider exposes an embeddings endpoint.
     virtual bool supportsEmbeddings() const { return false; }
 
-    /// Send an embedding request. Only valid when `supportsEmbeddings()` is true. Replaces the contents of
-    /// `response`, filling `input_tokens` before the payload is validated: so a failed request can still update token counts
-    virtual void embed(
-        const AIEmbeddingRequest & ai_embedding_request, const ConnectionTimeouts & timeouts, AIEmbeddingResponse & response);
+    /// Send an embedding request. Only valid when `supportsEmbeddings()` is true.
+    virtual AIEmbeddingResponse embed(const AIEmbeddingRequest & ai_embedding_request, const ConnectionTimeouts & timeouts);
 };
 
 using AIProviderPtr = std::unique_ptr<IAIProvider>;
 
-AIProviderPtr createAIProvider(const String & provider_name, const String & endpoint, const String & api_key, const String & api_version);
+/// Also validates the provider's headers with `HTTPHeaderFilter`.
+AIProviderPtr createAIProvider(
+    const ContextPtr & context,
+    const String & provider_name, const String & endpoint, const String & api_key, const String & api_version);
 
 /// Build an error message from a provider's non-200 HTTP response, for use in an exception that is logged.
 String formatProviderError(int status_code, const String & response_body);
