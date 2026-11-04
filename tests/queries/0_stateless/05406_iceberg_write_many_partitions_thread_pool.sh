@@ -17,6 +17,7 @@ trap 'rm -rf "${TABLE_DIR}"' EXIT
 
 COLS=$(for i in $(seq 16); do printf ', c%d Int64' "$i"; done)
 EXPRS=$(for i in $(seq 16); do printf ', number * %d' "$i"; done)
+# All `background_schedule_pool_size` threads start with the process, so that pool must fit in the 300-thread one.
 SETTINGS="SET allow_insert_into_iceberg = 1, max_insert_threads = 1, max_threads = 16, output_format_parquet_parallel_encoding = 1"
 
 # INSERT, then ALTER TABLE ... UPDATE, which writes one position delete file and one data file per partition.
@@ -27,7 +28,7 @@ ${CLICKHOUSE_LOCAL} --query "
     SELECT count(), uniqExact(_path) FROM t;
     ALTER TABLE t UPDATE c1 = c1 + 1 WHERE 1;
     SELECT count(), sum(c1) FROM t;
-" -- --max_thread_pool_size=300 --thread_pool_queue_size=300
+" -- --max_thread_pool_size=300 --thread_pool_queue_size=300 --background_schedule_pool_size=16
 
 # ALTER TABLE ... DELETE writes two-column position delete files, so it needs more partitions to fill the pool.
 ${CLICKHOUSE_LOCAL} --query "
@@ -36,4 +37,4 @@ ${CLICKHOUSE_LOCAL} --query "
     INSERT INTO t SELECT number % 80, number FROM numbers(2000);
     ALTER TABLE t DELETE WHERE x >= 1000;
     SELECT count(), sum(x) FROM t;
-" -- --max_thread_pool_size=300 --thread_pool_queue_size=300
+" -- --max_thread_pool_size=300 --thread_pool_queue_size=300 --background_schedule_pool_size=16
