@@ -579,6 +579,8 @@ public:
 
     bool supportsSubcolumns() const override { return true; }
 
+    bool hasBucketedMapSerialization() const override;
+
     bool supportsTTL() const override { return true; }
 
     bool supportsStatistics() const override { return true; }
@@ -706,6 +708,11 @@ public:
 
     /// The same as above but does not hold vector of data parts.
     StorageSnapshotPtr getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
+
+    /// Removes the snapshot of this table from the query-scoped snapshot cache of
+    /// `enable_shared_storage_snapshot_in_query`, so that the next `getStorageSnapshot` in the query
+    /// takes a fresh one. Holders of the removed snapshot keep it.
+    void discardSharedStorageSnapshot(const ContextPtr & query_context) const;
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);
@@ -1154,6 +1161,11 @@ public:
 
     /// Throws if a column TTL is set on a column that a key reads, directly or through a subcolumn.
     static void checkColumnTTLsForKeyColumns(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata);
+
+    /// The expressions stored in the metadata (keys, TTL, skip indices, projections) are built with the global context,
+    /// which has full access, and are executed in the background. Builds them again with a copy of the query context,
+    /// which checks the user's access to their functions and rejects functions that are not executed in the background.
+    static void checkStoredExpressions(const StorageInMemoryMetadata & metadata, const ContextPtr & local_context);
 
     /// Throw exception if command is some kind of DROP command (drop column, drop index, etc) or rename command
     /// and we have unfinished mutation which need this column to finish.

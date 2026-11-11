@@ -85,6 +85,7 @@
 
 #include <Storages/IStorage.h>
 #include <Storages/PartitionCommands.h>
+#include <Common/FailPoint.h>
 #include <Common/FieldVisitorToString.h>
 
 #include <Common/ProfileEvents.h>
@@ -121,10 +122,13 @@ extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
-extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
-extern const int FILE_ALREADY_EXISTS;
+}
+
+namespace FailPoints
+{
+extern const char iceberg_metadata_prefetch_pause[];
 }
 
 namespace Setting
@@ -327,6 +331,9 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
 
     try
     {
+        /// Lets a test hold the refresher before it reads the latest metadata
+        FailPointInjection::pauseFailPoint(FailPoints::iceberg_metadata_prefetch_pause);
+
         if (!Context::getGlobalContextInstance())
         {
             /// Should never happen, but if seen, this is clear indicator that the task should be started/stopped via startup/shutdown mechanism (check TODOs above)
@@ -1084,10 +1091,7 @@ void IcebergMetadata::createInitial(
         }
         catch (const Exception & e)
         {
-            const bool precondition_failed
-                = (e.code() == ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
-                || e.code() == ErrorCodes::FILE_ALREADY_EXISTS;
-            if (if_not_exists && precondition_failed)
+            if (if_not_exists && isConditionalWriteConflict(e))
                 return;
             throw;
         }

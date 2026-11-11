@@ -1558,6 +1558,7 @@ ContextData::ContextData(const ContextData &o) :
     is_background_operation(o.is_background_operation),
     is_ddl_or_on_cluster_internal(o.is_ddl_or_on_cluster_internal),
     is_recovery_from_stored_metadata(o.is_recovery_from_stored_metadata),
+    is_analyzing_background_expressions(o.is_analyzing_background_expressions),
     skip_forced_projection_check(o.skip_forced_projection_check),
     is_view_inner_query(o.is_view_inner_query),
     positional_arguments_already_resolved(o.positional_arguments_already_resolved),
@@ -6162,7 +6163,7 @@ BackgroundSchedulePoolPtr Context::getBufferFlushSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_buffer_flush_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundBufferFlushSchedulePoolTask,
             CurrentMetrics::BackgroundBufferFlushSchedulePoolSize,
             ThreadName::BACKGROUND_BUFFER_FLUSH_SCHEDULE_POOL);
@@ -6223,9 +6224,6 @@ BackgroundTaskSchedulingSettings Context::getBackgroundStreamingTaskSchedulingSe
 
 BackgroundSchedulePoolPtr Context::getSchedulePool() const
 {
-    size_t max_parallel_tasks_per_type = static_cast<size_t>(
-        static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_size])
-        * static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_max_parallel_tasks_per_type_ratio]));
     callOnce(
         shared->schedule_pool_initialized,
         [&]
@@ -6233,7 +6231,7 @@ BackgroundSchedulePoolPtr Context::getSchedulePool() const
             auto created_pool = BackgroundSchedulePool::create(
                 shared->server_settings[ServerSetting::background_schedule_pool_size],
                 shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-                max_parallel_tasks_per_type,
+                static_cast<double>(shared->server_settings[ServerSetting::background_schedule_pool_max_parallel_tasks_per_type_ratio]),
                 CurrentMetrics::BackgroundSchedulePoolTask,
                 CurrentMetrics::BackgroundSchedulePoolSize,
                 DB::ThreadName::BACKGROUND_SCHEDULE_POOL);
@@ -6251,7 +6249,7 @@ BackgroundSchedulePoolPtr Context::getDistributedSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_distributed_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundDistributedSchedulePoolTask,
             CurrentMetrics::BackgroundDistributedSchedulePoolSize,
             DB::ThreadName::DISTRIBUTED_SCHEDULE_POOL);
@@ -6269,7 +6267,7 @@ BackgroundSchedulePoolPtr Context::getMessageBrokerSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_message_broker_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundMessageBrokerSchedulePoolTask,
             CurrentMetrics::BackgroundMessageBrokerSchedulePoolSize,
             DB::ThreadName::MSG_BROKER_SCHEDULE_POOL);
@@ -6287,7 +6285,7 @@ BackgroundSchedulePoolPtr Context::getIcebergSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::iceberg_background_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::IcebergSchedulePoolTask,
             CurrentMetrics::IcebergSchedulePoolSize,
             DB::ThreadName::ICEBERG_SCHEDULE_POOL);
@@ -6305,7 +6303,7 @@ BackgroundSchedulePoolPtr Context::getStreamingSchedulePool() const
         auto created_pool = BackgroundSchedulePool::create(
             shared->server_settings[ServerSetting::background_streaming_schedule_pool_size],
             shared->server_settings[ServerSetting::background_schedule_pool_initial_size],
-            /*max_parallel_tasks_per_type*/ 0,
+            /*max_parallel_tasks_per_type_ratio*/ 0,
             CurrentMetrics::BackgroundStreamingSchedulePoolTask,
             CurrentMetrics::BackgroundStreamingSchedulePoolSize,
             DB::ThreadName::BACKGROUND_STREAMING_SCHEDULE_POOL);
