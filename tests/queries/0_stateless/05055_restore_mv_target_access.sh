@@ -35,8 +35,8 @@ CREATE DATABASE $db_ext ENGINE = Filesystem;
 CREATE TABLE $db.src (k UInt64) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE $db.own (k UInt64) ENGINE = MergeTree ORDER BY k;
 CREATE TABLE $db.dst (k UInt64) ENGINE = MergeTree ORDER BY k;
-CREATE TABLE $db.metrics (metric_family String, type String, unit String, help String)
-    ENGINE = ReplacingMergeTree ORDER BY metric_family;
+CREATE TABLE $db.metrics (metric_family_name String, type String, unit String, help String)
+    ENGINE = ReplacingMergeTree ORDER BY metric_family_name;
 CREATE MATERIALIZED VIEW $db.mv_own TO $db.own AS SELECT k FROM $db.src;
 CREATE MATERIALIZED VIEW $db.mv_inner ENGINE = MergeTree ORDER BY k AS SELECT k FROM $db.src;
 CREATE USER $user;
@@ -48,15 +48,13 @@ GRANT BACKUP ON $db.mv_own TO $user;
 GRANT BACKUP ON $db.mv_inner TO $user;
 GRANT BACKUP ON $db.own TO $user;
 GRANT BACKUP ON $db.metrics TO $user;
--- A Disk(...) backup location is authorized against the DISK source: writing a backup needs WRITE
--- ON DISK and reading one needs READ ON DISK. Neither half says anything about a view target.
-GRANT READ ON DISK, WRITE ON DISK TO $user;
+GRANT BACKUP ON $db.ts TO $user;
 -- The inner-table arm needs this under table_engines_require_grant, on CREATE too. It confers no
 -- SELECT or INSERT, so every denial below still comes from the view target.
 GRANT TABLE ENGINE ON MergeTree TO $user;
--- Same for the TimeSeries arm: creating that table locally needs the engines and a temporary table.
+-- Same for the TimeSeries case: creating that table needs the engines and CREATE TABLE.
 GRANT TABLE ENGINE ON TimeSeries, TABLE ENGINE ON AggregatingMergeTree, TABLE ENGINE ON ReplacingMergeTree TO $user;
-GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.* TO $user;
+GRANT CREATE TABLE ON $db.* TO $user;
 GRANT CREATE DATABASE, CREATE TABLE, CREATE VIEW ON $db_restored.* TO $user;
 "
 
@@ -103,29 +101,28 @@ echo "-- a view with an inner table carries no target id, so it is still allowed
 deny_or_allow "BACKUP TABLE $db.mv_inner TO $bk_inner FORMAT Null"
 deny_or_allow "RESTORE TABLE $db.mv_inner AS $db.mv_inner_ok FROM $bk_inner FORMAT Null"
 
-# A `TimeSeries` table reaches the same primitive through its external targets (`version` 9 or earlier),
-# and a temporary one is checked on a separate branch of the restore gate, so it needs its own arm.
-echo "-- a temporary TimeSeries table forges the same primitive through an external target"
+# A `TimeSeries` table reaches the same primitive through its external targets. 26.3 cannot create
+# a temporary one, so this case uses an ordinary table.
+echo "-- a TimeSeries table forges the same primitive through an external target"
 if ${CLICKHOUSE_CLIENT} --user "$user" --multiquery -q "
     SET allow_experimental_time_series_table = 1;
-    CREATE TEMPORARY TABLE ts ENGINE = TimeSeries SETTINGS version = 9 METRICS $db.metrics;
-    BACKUP TEMPORARY TABLE ts, TABLE $db.metrics AS $db.dst TO $bk_ts SETTINGS structure_only = 1 FORMAT Null;
+    CREATE TABLE $db.ts ENGINE = TimeSeries METRICS $db.metrics;
+    BACKUP TABLE $db.ts, TABLE $db.metrics AS $db.dst TO $bk_ts SETTINGS structure_only = 1 FORMAT Null;
     " > /dev/null 2>&1; then echo "forged"; else echo "forge failed"; fi
-deny_or_allow "RESTORE TEMPORARY TABLE ts AS ts2 FROM $bk_ts SETTINGS structure_only = 1 FORMAT Null"
+deny_or_allow "RESTORE TABLE $db.ts AS $db.ts2 FROM $bk_ts SETTINGS structure_only = 1 FORMAT Null"
 echo "-- and that denial names the forged target too"
 ${CLICKHOUSE_CLIENT} --user "$user" -q \
-    "RESTORE TEMPORARY TABLE ts AS ts2 FROM $bk_ts SETTINGS structure_only = 1 FORMAT Null" 2>&1 \
+    "RESTORE TABLE $db.ts AS $db.ts2 FROM $bk_ts SETTINGS structure_only = 1 FORMAT Null" 2>&1 \
     | grep -c -m1 'INSERT ON '"$db"'\.dst'
 
-# A database with an external engine is skipped whole, so nothing under it is created and a view
-# there can write nowhere. The same backup with the setting off does restore it, and does require
-# the target, which is what keeps this pair from passing on an empty backup.
-echo "-- a view under a database the restore skips does not require its target"
+# 26.3 does not skip a database with an external engine under `restore_replace_external_engines_to_null`:
+# it tries to restore the tables under it too, so a view there requires its target either way.
+echo "-- a view under a database with an external engine requires its target"
 ${CLICKHOUSE_CLIENT} -q "BACKUP DATABASE $db_ext, TABLE $db.mv_own AS $db_ext.mv, TABLE $db.own AS $db.dst
     TO $bk_ext SETTINGS structure_only = 1 FORMAT Null"
 deny_or_allow "RESTORE DATABASE $db_ext AS $db_restored FROM $bk_ext
     SETTINGS restore_replace_external_engines_to_null = 1, structure_only = 1 FORMAT Null"
-echo "-- nothing was created, so the grant it used to demand was never needed"
+echo "-- nothing was created by the rejected restore"
 ${CLICKHOUSE_CLIENT} -q "SELECT count() FROM system.tables WHERE database = '$db_restored'"
 echo "-- with the setting off the same backup is restored, and then it does require the target"
 deny_or_allow "RESTORE DATABASE $db_ext AS $db_restored FROM $bk_ext SETTINGS structure_only = 1 FORMAT Null"
