@@ -28,8 +28,7 @@ INSERT INTO t_minmax SELECT number, 1, 500, number FROM numbers(16);
 -- Only the row with x = 9 matches each filter below.
 SELECT count() FROM t_minmax WHERE NOT (coalesce(c, b) > 10) OR x = 9 SETTINGS use_skip_indexes_on_data_read = 0;
 SELECT count() FROM t_minmax WHERE NOT (coalesce(c, b) > 10) OR x = 9 SETTINGS use_skip_indexes_on_data_read = 1;
-SELECT count() FROM t_minmax WHERE (NOT (coalesce(c, b) > 10) OR x = 9) AND x + 0 < 2000 AND x + 1 < 2000 AND x + 2 < 2000 AND x + 3 < 2000 AND x + 4 < 2000 AND x + 5 < 2000 AND x + 6 < 2000 AND x + 7 < 2000 AND x + 8 < 2000 AND x + 9 < 2000 AND x + 10 < 2000 AND x + 11 < 2000 AND x + 12 < 2000 AND x + 13 < 2000 AND x + 14 < 2000
-SETTINGS use_skip_indexes_for_disjunctions_max_rpn_elements = 128;
+SELECT count() FROM t_minmax WHERE (NOT (coalesce(c, b) > 10) OR x = 9) AND x + 0 < 2000 AND x + 1 < 2000 AND x + 2 < 2000 AND x + 3 < 2000 AND x + 4 < 2000 AND x + 5 < 2000 AND x + 6 < 2000 AND x + 7 < 2000 AND x + 8 < 2000 AND x + 9 < 2000 AND x + 10 < 2000 AND x + 11 < 2000 AND x + 12 < 2000 AND x + 13 < 2000 AND x + 14 < 2000;
 SELECT count() FROM t_minmax WHERE NOT (ifNull(c, b) > 10) OR x = 9;
 SELECT count() FROM t_minmax WHERE NOT (coalesce(c, b) != 7) OR x = 9;
 SELECT count() FROM t_minmax WHERE NOT (ifNull(c < 10 OR b > 100, 0) = 0) OR x = 9;
