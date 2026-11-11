@@ -64,6 +64,11 @@ def with_url_wildcard_setting(query):
     return f"{query} SETTINGS {URL_WILDCARD_EXPERIMENTAL_SETTING}"
 
 
+def server_part_of_error(error):
+    # The client appends "(query: ...)" with the query text as sent, credentials included.
+    return error.split("(query: ")[0]
+
+
 def test_partition_by():
     result = node1.query(
         "select * from url('http://nginx:80/test_1', 'TSV', 'column1 UInt32, column2 UInt32, column3 UInt32')"
