@@ -63,6 +63,7 @@ DROP TABLE t_rp_const_set;
 
 -- GraphiteMergeTree rolls up rows with different times into one row: only a policy on the leading path column
 -- is applied before FINAL.
+-- `count(Version)`: on 26.10 a Graphite FINAL read that does not select `Version` fails with NOT_FOUND_COLUMN_IN_BLOCK (#127521).
 SET optimize_on_insert = 0;
 DROP TABLE IF EXISTS t_rp_const_graphite;
 DROP TABLE IF EXISTS t_rp_const_graphite_time_first;
@@ -74,19 +75,19 @@ INSERT INTO t_rp_const_graphite VALUES ('sum_1', 960000100, 1, 1), ('sum_1', 960
 SELECT 'Graphite time';
 CREATE ROW POLICY p_rp_const ON t_rp_const_graphite USING Time >= if(now() > toDateTime('2000-01-01'), toDateTime(960000150, 'UTC'), toDateTime(0, 'UTC')) TO ALL;
 SELECT count() FROM (EXPLAIN actions = 1 SELECT * FROM t_rp_const_graphite FINAL) WHERE explain LIKE '%Deferred row level filter%';
-SELECT count(), sum(Value) FROM t_rp_const_graphite FINAL;
+SELECT count(Version), sum(Value) FROM t_rp_const_graphite FINAL;
 DROP ROW POLICY p_rp_const ON t_rp_const_graphite;
 
 SELECT 'Graphite time, literal';
 CREATE ROW POLICY p_rp_const ON t_rp_const_graphite USING Time <= toDateTime(960000150, 'UTC') TO ALL;
 SELECT count() FROM (EXPLAIN actions = 1 SELECT * FROM t_rp_const_graphite FINAL) WHERE explain LIKE '%Deferred row level filter%';
-SELECT count(), sum(Value) FROM t_rp_const_graphite FINAL;
+SELECT count(Version), sum(Value) FROM t_rp_const_graphite FINAL;
 DROP ROW POLICY p_rp_const ON t_rp_const_graphite;
 
 SELECT 'Graphite leading path';
 CREATE ROW POLICY p_rp_const ON t_rp_const_graphite USING Path = if(now() > toDateTime('2000-01-01'), 'sum_1', '') TO ALL;
 SELECT count() FROM (EXPLAIN actions = 1 SELECT * FROM t_rp_const_graphite FINAL) WHERE explain LIKE '%Deferred row level filter%';
-SELECT count(), sum(Value) FROM t_rp_const_graphite FINAL;
+SELECT count(Version), sum(Value) FROM t_rp_const_graphite FINAL;
 DROP ROW POLICY p_rp_const ON t_rp_const_graphite;
 
 CREATE TABLE t_rp_const_graphite_time_first (Time DateTime('UTC'), Path String, Value Float64, Version UInt32)
@@ -96,7 +97,7 @@ INSERT INTO t_rp_const_graphite_time_first VALUES (960000100, 'sum_a', 1, 1), (9
 SELECT 'Graphite path not leading';
 CREATE ROW POLICY p_rp_const ON t_rp_const_graphite_time_first USING Path = if(now() > toDateTime('2000-01-01'), 'sum_a', '') TO ALL;
 SELECT count() FROM (EXPLAIN actions = 1 SELECT * FROM t_rp_const_graphite_time_first FINAL) WHERE explain LIKE '%Deferred row level filter%';
-SELECT count(), sum(Value) FROM t_rp_const_graphite_time_first FINAL;
+SELECT count(Version), sum(Value) FROM t_rp_const_graphite_time_first FINAL;
 DROP ROW POLICY p_rp_const ON t_rp_const_graphite_time_first;
 
 DROP TABLE t_rp_const_graphite;
