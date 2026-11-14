@@ -4371,7 +4371,21 @@ ActionsDAG::ActionsForJOINFilterPushDown ActionsDAG::splitActionsForJOINFilterPu
     /// Two copies of a runtime filter may pass different rows, and a match removed from the side an OUTER or ANTI
     /// join only matches against makes that join emit a row it would not, so no equivalent copy is pushed there.
     auto is_runtime_filter = [](const Node * conjunct)
-    { return anyReachableNode({conjunct}, [](const Node * node) { return node->is_runtime_filter_id; }); };
+    {
+        std::vector<const Node *> to_visit{conjunct};
+        std::unordered_set<const Node *> visited;
+        while (!to_visit.empty())
+        {
+            const auto * node = to_visit.back();
+            to_visit.pop_back();
+            if (!visited.insert(node).second)
+                continue;
+            if (node->is_runtime_filter_id)
+                return true;
+            to_visit.insert(to_visit.end(), node->children.begin(), node->children.end());
+        }
+        return false;
+    };
 
     auto collect_side_conjunctions_in_written_order = [&](const NodeRawConstPtrs & side_allowed_conjunctions, bool keep_runtime_filters_out)
     {
