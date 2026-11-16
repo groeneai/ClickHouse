@@ -298,6 +298,32 @@ struct NormalProjectionCandidate : public ProjectionCandidate
 {
 };
 
+/// fills the outcome of the hypothetical projection, the candidate loop sets its flags
+static void recordHypotheticalOutcome(
+    HypotheticalProjection & hypothetical,
+    const UseProjectionsResult & result,
+    const std::list<NormalProjectionCandidate> & candidates,
+    const NormalProjectionCandidate * best_candidate)
+{
+    auto & outcome = hypothetical.outcome;
+    if (auto it = result.projection_reject_reasons.find(hypothetical.projection.name); it != result.projection_reject_reasons.end())
+        outcome.reason = it->second;
+    for (const auto & candidate : candidates)
+    {
+        if (candidate.projection != &hypothetical.projection || !candidate.stat)
+            continue;
+        outcome.marks = candidate.sum_marks;
+        outcome.rows = candidate.selected_rows;
+        outcome.chosen = &candidate == best_candidate;
+        if (!candidate.stat->description.empty())
+            outcome.reason = candidate.stat->description;
+        if (candidate.merge_tree_projection_select_result_ptr)
+            for (const auto & part : candidate.merge_tree_projection_select_result_ptr->parts_with_ranges)
+                outcome.ranges[part.parent_part->name] = part.ranges;
+    }
+    outcome.forced = outcome.forced && outcome.chosen;
+}
+
 static std::optional<ActionsDAG> makeMaterializingDAG(const Block & proj_header, const Block & main_header)
 {
     /// Materialize constants in case we don't have it in output header.
@@ -355,15 +381,11 @@ UseProjectionsResult optimizeUseNormalProjections(
     for (const auto & projection : projections)
         if (projection.type == ProjectionDescription::Type::Normal)
             normal_projections.push_back(&projection);
-    /// the optimization of aggregate projections weighs a hypothetical aggregate projection
-    auto hypothetical = reading->getHypotheticalProjection();
-    if (hypothetical && hypothetical->projection.type != ProjectionDescription::Type::Normal)
-        hypothetical = nullptr;
+    const auto hypothetical = reading->getHypotheticalProjection();
     if (hypothetical)
     {
         normal_projections.push_back(&hypothetical->projection);
         hypothetical->outcome = {};
-        hypothetical->outcome.weighed = true;
     }
 
     auto reject_all = [&](const String & reason)
@@ -372,7 +394,7 @@ UseProjectionsResult optimizeUseNormalProjections(
         if (hypothetical)
         {
             hypothetical->outcome.rejected_for_query = true;
-            recordHypotheticalOutcome(*hypothetical, result, nullptr, false);
+            recordHypotheticalOutcome(*hypothetical, result, {}, nullptr);
         }
         return std::move(result);
     };
@@ -478,32 +500,10 @@ UseProjectionsResult optimizeUseNormalProjections(
     NormalProjectionCandidate * best_candidate = nullptr;
 
     const auto & query_info = reading->getQueryInfo();
+    /// Even over the row limit, this is the analysis the read executes with: the projections below prune it, not a copy of it.
     auto parent_reading_select_result = reading->getAnalyzedResult();
     if (!parent_reading_select_result)
         parent_reading_select_result = reading->selectRangesToRead();
-
-    /// parent parts (non-projection result) exceeded limits
-    /// construct a base AnalysisResult with all parts to analyze projection candidates
-    if (!parent_reading_select_result->isUsable())
-    {
-        const auto & parts = reading->getParts();
-
-        parent_reading_select_result = std::make_shared<ReadFromMergeTree::AnalysisResult>();
-        parent_reading_select_result->parts_with_ranges = parts;
-        parent_reading_select_result->selected_parts = parts.size();
-        parent_reading_select_result->exceeded_row_limits = true;
-
-        size_t total_marks = 0;
-        size_t total_rows = 0;
-        for (const auto & part : parts)
-        {
-            total_marks += part.data_part->getMarksCount();
-            total_rows += part.data_part->rows_count;
-        }
-        parent_reading_select_result->selected_marks = total_marks;
-        parent_reading_select_result->selected_rows = total_rows;
-        parent_reading_select_result->selected_ranges = parts.size();
-    }
 
     if (!relax_projection_checks)
     {
@@ -594,9 +594,6 @@ UseProjectionsResult optimizeUseNormalProjections(
             {
                 LOG_DEBUG(logger, "Projection {} skipped: query WHERE does not imply projection WHERE", projection->name);
                 result.projection_reject_reasons.try_emplace(projection->name, "the query WHERE does not imply the projection WHERE");
-                /// the query alone decides it, so WHATIF does not read data for this projection
-                if (hypothetical && projection == &hypothetical->projection)
-                    hypothetical->outcome.rejected_for_query = true;
                 continue;
             }
         }
@@ -681,27 +678,25 @@ UseProjectionsResult optimizeUseNormalProjections(
         /// - the projection's sort order matches the query's ORDER BY,
         if (!relax_projection_checks && candidate.sum_marks > parent_reading_marks)
         {
-            auto message = PreformattedMessage::create(
+            stat.description = fmt::format(
                 "Projection {} is usable but requires reading {} marks, which is not better than the original table with {} marks",
                 candidate.projection->name,
                 candidate.sum_marks,
                 parent_reading_marks);
-            stat.description = message.text;
 
             result.projection_reject_reasons.try_emplace(projection->name, stat.description);
-            LOG_DEBUG(logger, message);
+            LOG_DEBUG(logger, "{}", stat.description);
             continue;
         }
         else if (candidate.sum_marks == parent_reading_marks && parent_reading_marks > 0 && !relax_projection_checks && !sort_order_helps)
         {
-            auto message = PreformattedMessage::create(
+            stat.description = fmt::format(
                 "Projection {} is usable but requires reading {} marks and does not help with sorting, which is not better than the original table",
                 candidate.projection->name,
                 candidate.sum_marks);
-            stat.description = message.text;
 
             result.projection_reject_reasons.try_emplace(projection->name, stat.description);
-            LOG_DEBUG(logger, message);
+            LOG_DEBUG(logger, "{}", stat.description);
             continue;
         }
 
@@ -718,7 +713,7 @@ UseProjectionsResult optimizeUseNormalProjections(
     if (!best_candidate)
     {
         if (hypothetical)
-            recordHypotheticalOutcome(*hypothetical, result, findCandidate(candidates, &hypothetical->projection), false);
+            recordHypotheticalOutcome(*hypothetical, result, candidates, nullptr);
         return result;
     }
 
@@ -729,32 +724,29 @@ UseProjectionsResult optimizeUseNormalProjections(
         {
             chassert(candidate.stat);
             chassert(candidate.stat->description.empty());
-            auto message = PreformattedMessage::create(
+            candidate.stat->description = fmt::format(
                 "Projection {} is selected as the best with {} marks to read, while the original table requires scanning {} marks",
                 candidate.projection->name,
                 candidate.sum_marks,
                 parent_reading_select_result->selected_marks);
-            candidate.stat->description = message.text;
-            LOG_DEBUG(logger, message);
+            LOG_DEBUG(logger, "{}", candidate.stat->description);
         }
         else if (candidate.stat && candidate.stat->description.empty())
         {
-            auto message = PreformattedMessage::create(
+            candidate.stat->description = fmt::format(
                 "Projection {} is usable but requires reading {} marks, which is less efficient than projection {} with {} marks",
                 candidate.projection->name,
                 candidate.sum_marks,
                 best_candidate->projection->name,
                 best_candidate->sum_marks);
-            candidate.stat->description = message.text;
             result.projection_reject_reasons.try_emplace(candidate.projection->name, candidate.stat->description);
-            LOG_DEBUG(logger, message);
+            LOG_DEBUG(logger, "{}", candidate.stat->description);
         }
     }
 
     if (hypothetical)
     {
-        const auto * own = findCandidate(candidates, &hypothetical->projection);
-        recordHypotheticalOutcome(*hypothetical, result, own, own == best_candidate);
+        recordHypotheticalOutcome(*hypothetical, result, candidates, best_candidate);
         /// never read a hypothetical projection
         if (best_candidate->projection == &hypothetical->projection)
             return result;

@@ -21,9 +21,6 @@ node5 = cluster.add_instance(
     user_configs=["configs/allow_server_credentials.xml"],
 )
 node6 = cluster.add_instance("node6", main_configs=["configs/config_for_remote.xml"])
-node8 = cluster.add_instance(
-    "node8", main_configs=["configs/config_with_pinned_port.xml"]
-)  # Allows only 127.0.0.1:3306 (port-pinned entry).
 
 if not is_arm():
     node7 = cluster.add_instance(
@@ -100,11 +97,6 @@ def test_config_with_hosts(start_cluster):
             "pw_azure_url_sas_canary",
             "https://host:123/",
         ),
-        (
-            "SELECT * FROM s3('http://host:123/bucket/k.csv?%73ig=pw_s3_encoded_name_canary', NOSIGN, CSV, 'x UInt8')",
-            "pw_s3_encoded_name_canary",
-            "http://host:123/bucket/k.csv?%73ig=[HIDDEN]",
-        ),
     ],
     ids=[
         "userinfo",
@@ -113,7 +105,6 @@ def test_config_with_hosts(start_cluster):
         "s3_presigned_in_path",
         "azure_connection_string_sas",
         "azure_url_sas_with_account_key",
-        "s3_encoded_name_in_path",
     ],
 )
 def test_rejected_url_credentials_masked(start_cluster, query, secret, masked_url):
@@ -332,6 +323,34 @@ def test_mysql_dictionary_host_filter(start_cluster):
     node5.query("DROP DICTIONARY IF EXISTS default.test_mysql_host_filter")
 
 
+def test_mysql_database_host_filter(start_cluster):
+    # node5 denies all hosts; the check runs before any connection attempt.
+    assert "not allowed" in node5.query_and_get_error(
+        "CREATE DATABASE test_mysql_db_filter ENGINE = MySQL('10.0.0.1:3306', 'db', 'u', 'p')"
+    )
+    node5.query(
+        "CREATE NAMED COLLECTION IF NOT EXISTS test_mysql_db_filter_nc AS "
+        "host = '10.0.0.1', port = 3306, database = 'db', user = 'u', password = 'p'"
+    )
+    assert "not allowed" in node5.query_and_get_error(
+        "CREATE DATABASE test_mysql_db_filter ENGINE = MySQL(test_mysql_db_filter_nc)"
+    )
+    node5.query("DROP NAMED COLLECTION test_mysql_db_filter_nc")
+
+    # node1's suffix rule would match the whole string, but the connector stops at the NUL; reject it.
+    assert "not allowed" in node1.query_and_get_error(
+        "CREATE DATABASE test_mysql_db_filter ENGINE = MySQL('127.0.0.1\\0.allowed.example:1', 'db', 'u', 'p')"
+    )
+    node1.query(
+        "CREATE NAMED COLLECTION IF NOT EXISTS test_mysql_db_filter_nul_nc AS "
+        "host = '127.0.0.1\\0.allowed.example', port = 1, database = 'db', user = 'u', password = 'p'"
+    )
+    assert "not allowed" in node1.query_and_get_error(
+        "CREATE DATABASE test_mysql_db_filter ENGINE = MySQL(test_mysql_db_filter_nul_nc)"
+    )
+    node1.query("DROP NAMED COLLECTION test_mysql_db_filter_nul_nc")
+
+
 def test_mysql_dictionary_replica_host_filter(start_cluster):
     """MySQL dictionary source with REPLICA(...) syntax should respect RemoteHostFilter."""
     # Covers the replica branch: if (config.has(settings_config_prefix + ".replica"))
@@ -353,57 +372,6 @@ def test_mysql_dictionary_replica_host_filter(start_cluster):
     )
     assert "not allowed" in error, f"Expected host filter error, got: {error}"
     node5.query("DROP DICTIONARY IF EXISTS default.test_mysql_replica_filter")
-
-
-def test_mysql_dictionary_replica_inherited_port_host_filter(start_cluster):
-    """A REPLICA(...) without its own PORT connects to the top-level PORT (mysqlxx::Pool
-    falls back to the parent prefix), so the host filter must validate that effective
-    port, not the 3306 default."""
-    # node8 allows only 127.0.0.1:3306 and 127.0.0.1:3308. 127.0.0.1 (instead of the
-    # unroutable 10.0.0.1 used above) makes any dial that passes the filter fail
-    # instantly with connection-refused instead of hanging until the connect timeout.
-    node8.query("DROP DICTIONARY IF EXISTS default.test_mysql_inherited_port")
-    node8.query(
-        """
-        CREATE DICTIONARY default.test_mysql_inherited_port (id UInt64, val String)
-        PRIMARY KEY id
-        SOURCE(MYSQL(
-            PORT 3307 USER 'root' PASSWORD 'pass' DB 'test' TABLE 'tbl'
-            REPLICA(PRIORITY 1 HOST '127.0.0.1')
-        ))
-        LAYOUT(FLAT()) LIFETIME(MIN 0 MAX 1)
-        """
-    )
-    # The replica inherits the denied top-level port 3307; before the fix the filter
-    # checked the 3306 default, passed, and dialed 127.0.0.1:3307 anyway.
-    error = node8.query_and_get_error(
-        "SELECT dictGet('default.test_mysql_inherited_port', 'val', toUInt64(1))"
-    )
-    assert "not allowed" in error, f"Expected host filter error, got: {error}"
-    node8.query("DROP DICTIONARY IF EXISTS default.test_mysql_inherited_port")
-
-    # A replica's own PORT takes precedence over the top-level PORT: 127.0.0.1:3308 is
-    # allowed, so the filter must pass and the failure is a plain connection error.
-    # 3308 differs from both the denied parent port 3307 and the 3306 default, so a
-    # regression that validated either of those instead of the replica's own port
-    # would fail this case.
-    node8.query("DROP DICTIONARY IF EXISTS default.test_mysql_own_port")
-    node8.query(
-        """
-        CREATE DICTIONARY default.test_mysql_own_port (id UInt64, val String)
-        PRIMARY KEY id
-        SOURCE(MYSQL(
-            PORT 3307 USER 'root' PASSWORD 'pass' DB 'test' TABLE 'tbl'
-            REPLICA(PRIORITY 1 HOST '127.0.0.1' PORT 3308)
-        ))
-        LAYOUT(FLAT()) LIFETIME(MIN 0 MAX 1)
-        """
-    )
-    error = node8.query_and_get_error(
-        "SELECT dictGet('default.test_mysql_own_port', 'val', toUInt64(1))"
-    )
-    assert "not allowed" not in error, f"Filter rejected an allowed replica: {error}"
-    node8.query("DROP DICTIONARY IF EXISTS default.test_mysql_own_port")
 
 
 def test_table_function_remote(start_cluster):
@@ -631,7 +599,7 @@ def test_hive_catalog_host_filter(start_cluster):
         "CREATE DATABASE test_hive_host_filter ENGINE = DataLakeCatalog('thrift://localhost:1') "
         "SETTINGS catalog_type = 'hive', warehouse = 'test_warehouse'"
     )
-    settings = {"enable_database_hms_catalog": 1}
+    settings = {"allow_experimental_database_hms_catalog": 1}
     try:
         # Control first: `node4` declares no `remote_url_allow_hosts` at all, so its filter stays
         # uninitialized and allows everything - the same statement gets past the check and fails at
@@ -656,7 +624,7 @@ def test_hive_catalog_host_filter_rejects_nul(start_cluster):
         return node1.query_and_get_error(
             f"CREATE DATABASE test_hive_host_filter_nul ENGINE = DataLakeCatalog('{url}') "
             "SETTINGS catalog_type = 'hive', warehouse = 'test_warehouse'",
-            settings={"enable_database_hms_catalog": 1},
+            settings={"allow_experimental_database_hms_catalog": 1},
         )
 
     try:

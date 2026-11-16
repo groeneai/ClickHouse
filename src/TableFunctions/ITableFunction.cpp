@@ -1,6 +1,5 @@
 #include <Access/ContextAccess.h>
 #include <TableFunctions/ITableFunction.h>
-#include <Storages/StorageAlias.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageTableFunction.h>
 #include <Access/Common/AccessFlags.h>
@@ -14,14 +13,13 @@ namespace ProfileEvents
     extern const Event TableFunctionExecute;
 }
 
-namespace DB
-{
-
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
-    extern const int ACCESS_DENIED;
+    extern const int LOGICAL_ERROR;;
 }
+
+namespace DB
+{
 
 const char * ITableFunction::getNonClusteredStorageEngineName() const
 {
@@ -47,18 +45,11 @@ void ITableFunction::checkSourceAccess(ContextPtr context, bool is_insert_query)
     }
 }
 
-void ITableFunction::checkSourceTableAccess(const ContextPtr & context, const StorageID & table_id, AccessType access_type) const
+void ITableFunction::checkCreateTemporaryTableAccess(ContextPtr context, bool is_insert_query) const
 {
-    context->checkAccess(access_type, table_id);
-}
-
-void ITableFunction::checkSourceStorageAccess(
-    const ContextPtr & context, const StoragePtr & storage, const StorageID & table_id, AccessType access_type) const
-{
-    if (const auto * alias = storage ? storage->as<StorageAlias>() : nullptr;
-        alias && !alias->isTargetTableGranted(context, access_type, {}))
-        throw Exception(
-            ErrorCodes::ACCESS_DENIED, "Not enough privileges to access the table that {} points to", table_id.getNameForLogs());
+    auto table_function_properties = TableFunctionFactory::instance().tryGetProperties(getName());
+    if (is_insert_query || !(table_function_properties && table_function_properties->allow_readonly))
+        context->checkAccess(AccessType::CREATE_TEMPORARY_TABLE);
 }
 
 void ITableFunction::checkEngineAccess(ContextPtr context) const
@@ -76,7 +67,10 @@ ColumnsDescription ITableFunction::getActualTableStructureWithAccess(ContextPtr 
     /// Resolving table structure is always a read operation.
     checkSourceAccess(context, /*is_insert_query*/ false);
     checkEngineAccess(context);
-    checkSourceObjectAccess(context, /*for_structure=*/ true);
+    /// Resolving the structure may access the source (e.g. schema inference fetches a URL), so it must be
+    /// gated in the same way as `execute`: otherwise `DESCRIBE TABLE url(...)` would let a user who cannot
+    /// run the table function (e.g. under `readonly = 1`) make the server request an endpoint.
+    checkCreateTemporaryTableAccess(context, /*is_insert_query*/ false);
     return getActualTableStructure(context, is_insert_query);
 }
 
@@ -88,13 +82,11 @@ StoragePtr ITableFunction::execute(const ASTPtr & ast_function, ContextPtr conte
     if (check_source_access)
         checkSourceAccess(context, is_insert_query);
 
-    /// Deliberately not under `check_source_access`: no caller takes over these checks.
+    /// Deliberately not under `check_source_access`: no caller takes over the engine check.
     checkEngineAccess(context);
-    checkSourceObjectAccess(context, /*for_structure=*/ false);
 
-    auto table_function_properties = TableFunctionFactory::instance().tryGetProperties(getName());
-    if (check_create_temporary_table && (is_insert_query || !(table_function_properties && table_function_properties->allow_readonly)))
-        context->checkAccess(AccessType::CREATE_TEMPORARY_TABLE);
+    if (check_create_temporary_table)
+        checkCreateTemporaryTableAccess(context, is_insert_query);
 
     auto context_to_use = use_global_context ? context->getGlobalContext() : context;
 
@@ -112,22 +104,16 @@ StoragePtr ITableFunction::execute(const ASTPtr & ast_function, ContextPtr conte
 
     /// It will request actual table structure and create underlying storage lazily
     return std::make_shared<StorageTableFunctionProxy>(StorageID(getDatabaseName(), table_name), std::move(get_storage),
-                                                       std::move(cached_columns), needStructureConversion(),
-                                                       hasUnreplicatedTableDataOnDisk());
+                                                       std::move(cached_columns), needStructureConversion());
 }
 
 String ITableFunction::getFunctionURINormalized() const
 {
-    return normalizeURIForAccessCheck(getFunctionURI());
-}
-
-String ITableFunction::normalizeURIForAccessCheck(const String & uri)
-{
     try
     {
-        Poco::URI parsed(uri);
-        parsed.normalize();
-        return parsed.toString();
+        Poco::URI uri(getFunctionURI());
+        uri.normalize();
+        return uri.toString();
     }
     catch (const Poco::Exception &)
     {
