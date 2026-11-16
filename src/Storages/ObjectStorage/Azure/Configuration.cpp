@@ -44,7 +44,6 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int LOGICAL_ERROR;
 }
 
 const std::unordered_set<std::string_view> required_configuration_keys = {
@@ -165,9 +164,9 @@ void AzureStorageParsedArguments::fillBlobsFromURLCommon(String & connection_url
 
     if (pos_container != std::string::npos)
     {
-        String container_blob_path = connection_url.substr(pos_container+5);
-        connection_url = connection_url.substr(0,pos_container+4);
-        container_name = connection_url.substr(pos_container+4);
+        size_t host_end = pos_container + suffix.size();
+        String container_blob_path = host_end < connection_url.size() ? connection_url.substr(host_end + 1) : "";
+        connection_url.resize(host_end);
         auto pos_blob_path = container_blob_path.find('/');
 
         if (pos_blob_path != std::string::npos)
@@ -179,7 +178,8 @@ void AzureStorageParsedArguments::fillBlobsFromURLCommon(String & connection_url
 
     /// Added for Unity Catalog on top of AzureBlobStorage
     // Sample abfss url : abfss://mycontainer@mydatalakestorage.dfs.core.windows.net/subdirectory/file.txt
-    if (connection_url.starts_with("abfss"))
+    /// `abfs` and `abfss` name the same ADLS Gen2 storage; both carry `://` so a near-prefix scheme like `abfsx://` is not matched.
+    if (connection_url.starts_with("abfss://") || connection_url.starts_with("abfs://"))
     {
         auto pos_slash = connection_url.find("://");
         auto pos_at = connection_url.find('@');
@@ -187,9 +187,9 @@ void AzureStorageParsedArguments::fillBlobsFromURLCommon(String & connection_url
         auto pos_net = connection_url.find(suffix);
 
         if (pos_slash == std::string::npos || pos_at == std::string::npos|| pos_dot == std::string::npos || pos_net == std::string::npos
-            || pos_at-pos_slash-3 <= 0 || pos_dot-pos_at-1 <= 0)
+            || pos_at <= pos_slash + 3 || pos_dot <= pos_at + 1)
         {
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Incorrect url format for a abfss url {}", connection_url);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Incorrect url format for an abfs/abfss url {}", connection_url);
         }
         auto container_name_abfss = connection_url.substr(pos_slash+3, pos_at-pos_slash-3);
         auto name = connection_url.substr(pos_at+1, pos_dot-pos_at-1);
