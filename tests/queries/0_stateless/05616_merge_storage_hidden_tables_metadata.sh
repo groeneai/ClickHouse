@@ -10,6 +10,7 @@ user2="u2_${CLICKHOUSE_DATABASE}"
 trivial="apply_patch_parts = 0, apply_mutations_on_fly = 0, optimize_trivial_count_query = 1, enable_parallel_replicas = 0, make_distributed_plan = 0, empty_result_for_aggregation_by_empty_set = 0"
 
 ${CLICKHOUSE_CLIENT} --multiline -q "
+SET allow_experimental_alias_table_engine = 1;
 DROP USER IF EXISTS ${user};
 DROP USER IF EXISTS ${user2};
 CREATE TABLE t_visible (id UInt32, s String) ENGINE = MergeTree ORDER BY id SETTINGS min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0;
