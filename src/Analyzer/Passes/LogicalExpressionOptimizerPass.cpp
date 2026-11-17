@@ -1,6 +1,5 @@
 #include <Analyzer/Passes/LogicalExpressionOptimizerPass.h>
 
-#include <Analyzer/AggregationUtils.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
@@ -406,7 +405,7 @@ struct ComparisonFilterInfo
     ComparisonFunction function;
     QueryTreeNodePtr original_node;          /// Original query tree node of this comparison.
     std::optional<Field> converted_value;    /// Constant converted to the column type.
-    size_t original_index = 0;               /// Slot in the AND argument list: its own position, or the earliest one of the filters it replaced.
+    size_t original_index = 0;               /// Position in the original AND argument list (for stable ordering).
     /// (e.g. for an Int32 column, `i < 3.5` is internally rewritten to `i <= 3`, with
     /// `function = LESS_OR_EQUALS` and `converted_value = 3`).  In that case `original_node`
     /// still references the old literal (3.5) and any later rebuild must substitute it with
@@ -955,12 +954,6 @@ static AddComparisonFilterResult addComparisonFilter(
         return result;
     }
 
-    /// A filter that replaces others takes the earliest of their slots, ahead of the operands they may guard.
-    auto take_slot = [&new_filter](const ComparisonFilterInfo & removed)
-    {
-        new_filter.original_index = std::min(new_filter.original_index, removed.original_index);
-    };
-
     /// Step 3: compare against the existing equals/range filters.
     auto & range_filters = filters.range_filters;
     for (size_t i = 0; i < range_filters.size(); ++i)
@@ -969,7 +962,6 @@ static AddComparisonFilterResult addComparisonFilter(
         switch (result)
         {
         case ValueComparisonResult::PRUNE_LEFT:
-            take_slot(range_filters[i]);
             range_filters.erase(range_filters.begin() + static_cast<std::ptrdiff_t>(i));
             --i;
             break;
@@ -998,7 +990,6 @@ static AddComparisonFilterResult addComparisonFilter(
         case ValueComparisonResult::STRENGTHEN_RIGHT:
             new_filter.function = strengthenComparison(new_filter.function);
             rebuildComparisonNode(new_filter, context);
-            take_slot(range_filters[i]);
             range_filters.erase(range_filters.begin() + static_cast<std::ptrdiff_t>(i));
             --i;
             break;
@@ -1011,12 +1002,6 @@ static AddComparisonFilterResult addComparisonFilter(
 
     auto & not_equals_filters = filters.not_equals_filters;
     Field key = canonicalizeNotEqualsKey(*new_filter.converted_value);
-    auto erase_not_equals = [&](auto first, auto last)
-    {
-        for (auto it = first; it != last; ++it)
-            take_slot(it->second);
-        not_equals_filters.erase(first, last);
-    };
 
     /// notEquals interact only through exact duplicates: one lookup replaces the pairwise scan,
     /// which was quadratic for long `x != c1 AND x != c2 ...` chains.
@@ -1035,7 +1020,7 @@ static AddComparisonFilterResult addComparisonFilter(
         /// `expr = c AND expr != c` is always false; any other `expr != v` is implied.
         if (not_equals_filters.contains(key))
             return AddComparisonFilterResult::ALWAYS_FALSE;
-        erase_not_equals(not_equals_filters.begin(), not_equals_filters.end());
+        not_equals_filters.clear();
     }
     else
     {
@@ -1043,29 +1028,27 @@ static AddComparisonFilterResult addComparisonFilter(
         {
         case ComparisonFunction::LESS:
             /// `expr < c` makes `expr != v` redundant for all v >= c; similar below.
-            erase_not_equals(not_equals_filters.lower_bound(key), not_equals_filters.end());
+            not_equals_filters.erase(not_equals_filters.lower_bound(key), not_equals_filters.end());
             break;
         case ComparisonFunction::LESS_OR_EQUALS:
-            erase_not_equals(not_equals_filters.upper_bound(key), not_equals_filters.end());
+            not_equals_filters.erase(not_equals_filters.upper_bound(key), not_equals_filters.end());
             /// `expr != c AND expr <= c` tightens to `expr < c`.
             if (auto it = not_equals_filters.find(key); it != not_equals_filters.end())
             {
                 new_filter.function = strengthenComparison(new_filter.function);
                 rebuildComparisonNode(new_filter, context);
-                take_slot(it->second);
                 not_equals_filters.erase(it);
             }
             break;
         case ComparisonFunction::GREATER:
-            erase_not_equals(not_equals_filters.begin(), not_equals_filters.upper_bound(key));
+            not_equals_filters.erase(not_equals_filters.begin(), not_equals_filters.upper_bound(key));
             break;
         case ComparisonFunction::GREATER_OR_EQUALS:
-            erase_not_equals(not_equals_filters.begin(), not_equals_filters.lower_bound(key));
+            not_equals_filters.erase(not_equals_filters.begin(), not_equals_filters.lower_bound(key));
             if (auto it = not_equals_filters.find(key); it != not_equals_filters.end())
             {
                 new_filter.function = strengthenComparison(new_filter.function);
                 rebuildComparisonNode(new_filter, context);
-                take_slot(it->second);
                 not_equals_filters.erase(it);
             }
             break;
@@ -1204,13 +1187,6 @@ struct CommonExpressionExtractionResult
     QueryTreeNodes common_expressions;
 };
 
-/// True if an element of `nodes` absent from `kept` contains `arrayJoin`.
-/// Dropping such an element from a filter also drops the rows its `arrayJoin` produces.
-static bool hasArrayJoinOutside(const QueryTreeNodePtrWithHashSet & nodes, const QueryTreeNodePtrWithHashSet & kept)
-{
-    return std::ranges::any_of(nodes, [&kept](const auto & node) { return !kept.contains(node) && hasFunctionNode(node.node, "arrayJoin"); });
-}
-
 // Optimize disjuctions by extracting common expressions in disjuncts.
 // Example: A or B or (B and C)
 // Result: A or B
@@ -1260,7 +1236,7 @@ static std::optional<CommonExpressionExtractionResult> tryExtractCommonExpressio
                 }
             }
 
-            if (is_subset && !hasArrayJoinOutside(disjunct_sets[j], current_set))
+            if (is_subset)
             {
                 should_keep[j] = false;
                 ++removed;
@@ -1378,10 +1354,10 @@ static std::optional<CommonExpressionExtractionResult> tryExtractCommonExpressio
     QueryTreeNodes new_or_arguments;
     bool has_completely_extracted_and_expression = false;
 
-    for (const auto & original_or_argument : or_argument_nodes)
+    for (auto & or_argument : or_argument_nodes)
     {
-        auto it = flattened_ands.find(original_or_argument);
-        const auto & or_argument = it != flattened_ands.end() ? it->second : original_or_argument;
+        if (auto it = flattened_ands.find(or_argument); it != flattened_ands.end())
+            or_argument = it->second;
 
         // Avoid changing the original tree, it might be used later
         const auto & and_node = or_argument->as<FunctionNode &>();
@@ -1398,7 +1374,8 @@ static std::optional<CommonExpressionExtractionResult> tryExtractCommonExpressio
         if (filtered_and_arguments.empty())
         {
             has_completely_extracted_and_expression = true;
-            continue;
+            // As we will discard new_or_arguments, no need for further processing
+            break;
         }
         else if (filtered_and_arguments.size() == 1)
         {
@@ -1417,12 +1394,7 @@ static std::optional<CommonExpressionExtractionResult> tryExtractCommonExpressio
 
     // If all the arguments of the OR expression is eliminated or one argument is completely eliminated, there is no need for new node.
     if (new_or_arguments.empty() || has_completely_extracted_and_expression)
-    {
-        /// Discarding `new_or_arguments` also discards the rows of an `arrayJoin` inside one of them.
-        if (std::ranges::any_of(new_or_arguments, [](const QueryTreeNodePtr & argument) { return hasFunctionNode(argument, "arrayJoin"); }))
-            return {};
         return CommonExpressionExtractionResult{nullptr, std::move(common_exprs)};
-    }
 
     // There are at least two arguments in the passed-in OR expression, thus we either completely eliminated at least one arguments, or there should be at least 2 remaining arguments.
     // The complete elimination is handled above, so at this point we can be sure there are at least 2 arguments.
@@ -1815,7 +1787,7 @@ public:
     /// True once this query has hashed more than `and_compare_chain_max_hash_work` nodes (across all
     /// getTreeHash calls) since this visitor started. Used by tryOptimizeAndCompareChain to back off.
     /// A budget of 0 means unlimited, so the optimization is never stopped early.
-    [[nodiscard]] bool andCompareChainHashBudgetExceeded() const
+    bool andCompareChainHashBudgetExceeded() const
     {
         return and_compare_chain_max_hash_work != 0
             && getTreeHashWorkCounter() - and_compare_chain_hash_work_start + and_compare_chain_reused_hash_work
@@ -1876,17 +1848,12 @@ public:
         return result;
     }
 
-    /// Shared nodes (identifier resolve cache) are rewritten once, after their arguments, and every reference reuses the result.
-    std::unordered_map<QueryTreeNodePtr, QueryTreeNodePtr> visited_nodes;
-
     /// a conjunct over these can't leave ON, and full_sorting_merge rejects it there
     TableExpressionNodes preserved_join_tables;
-    /// the join evaluates an input-less conjunct of ON with its left side
-    bool join_left_side_preserved = false;
 
     /// Whether the join may evaluate `node` with a preserved side: it reads a column of `preserved_join_tables` (constant folding in the
     /// join can drop every other column), or no column outside lambda and `indexHint` arguments, as the join evaluates that on the left.
-    [[nodiscard]] bool mayReadPreservedJoinTables(const QueryTreeNodePtr & node) const
+    bool mayReadPreservedJoinTables(const QueryTreeNodePtr & node) const
     {
         if (preserved_join_tables.empty())
             return false;
@@ -1922,36 +1889,13 @@ public:
         return !reads_other_table;
     }
 
-    void visitWithPreservedJoinSides(QueryTreeNodePtr & node, TableExpressionNodes tables, bool left_side_preserved)
-    {
-        std::swap(preserved_join_tables, tables);
-        std::swap(join_left_side_preserved, left_side_preserved);
-        visit(node);
-        std::swap(preserved_join_tables, tables);
-        std::swap(join_left_side_preserved, left_side_preserved);
-    }
-
     bool needChildVisit(QueryTreeNodePtr & parent, QueryTreeNodePtr & child)
     {
-        if (auto it = visited_nodes.find(child); it != visited_nodes.end())
-        {
-            child = it->second;
-            return false;
-        }
-
-        /// a subquery is a separate query, the sides of a join around it do not apply
-        if (isQueryOrUnionNode(child))
-        {
-            visitWithPreservedJoinSides(child, {}, false);
-            return false;
-        }
-
         const auto * join_node = parent->as<JoinNode>();
         if (!join_node || child != join_node->getJoinExpression())
             return true;
 
         TableExpressionNodes tables;
-        bool left_side_preserved = false;
         /// semi join keeps only matched rows
         if (join_node->getStrictness() != JoinStrictness::Semi)
         {
@@ -1959,12 +1903,11 @@ public:
                 tables = extractTableExpressions(join_node->getLeftTableExpressionNodeTyped(), /*add_array_join=*/ true);
             if (isRightOrFull(join_node->getKind()))
                 tables.append_range(extractTableExpressions(join_node->getRightTableExpressionNodeTyped(), /*add_array_join=*/ true));
-            /// the planner may swap the sides of a GLOBAL RIGHT JOIN, see tryRewriteGlobalRightJoinAsLeftJoin
-            left_side_preserved = isLeftOrFull(join_node->getKind())
-                || (join_node->getKind() == JoinKind::Right && isGlobalJoin(*join_node, getSettings()));
         }
 
-        visitWithPreservedJoinSides(child, std::move(tables), left_side_preserved);
+        std::swap(preserved_join_tables, tables);
+        visit(child);
+        std::swap(preserved_join_tables, tables);
         return false;
     }
 
@@ -1986,11 +1929,9 @@ public:
             auto * function_node = node->as<FunctionNode>();
             if (function_node && function_node->getFunctionName() == "and" && getSettings()[Setting::optimize_and_compare_chain])
                 tryOptimizeAndCompareChain(node);
+            return;
         }
-    }
 
-    void rewriteFunction(QueryTreeNodePtr & node)
-    {
         auto * function_node = node->as<FunctionNode>();
 
         if (!function_node)
@@ -2017,11 +1958,6 @@ public:
 
     void leaveImpl(QueryTreeNodePtr & node)
     {
-        auto original_node = node;
-        if (mode == Mode::OTHER_REWRITES)
-            rewriteFunction(node);
-        visited_nodes.emplace(std::move(original_node), node);
-
         if (mode == Mode::JOIN_ON_AND_COMPARE_CHAIN)
             return;
 
@@ -2148,8 +2084,7 @@ private:
             /// share a single value, we do not want pruning, folding (e.g. `rand() % 2 < 1 AND
             /// rand() % 2 >= 1` → false) or merging notEquals into NOT IN to rely on that. Keep such
             /// operands as-is.
-            /// Same for aggregate functions: removing the operand can leave the query without any.
-            if (hasNonDeterministicFunction(expression) || hasAggregateFunctionNodes(expression))
+            if (hasNonDeterministicFunction(expression))
             {
                 all_operands.emplace_back(argument_index, argument);
                 ++argument_index;
@@ -2188,10 +2123,6 @@ private:
 
             /// A `Nothing` operand collapses the AND's own result type to `Nothing`, which holds no value.
             if (isNothing(function_node.getResultType()))
-                return;
-
-            /// The constant would also drop the kept operands, and with them the query's aggregation or `arrayJoin`.
-            if (hasAggregateFunctionNodes(node) || hasFunctionNode(node, "arrayJoin"))
                 return;
 
             node = std::make_shared<ConstantNode>(0u, function_node.getResultType());
@@ -2595,7 +2526,10 @@ private:
         QueryTreeNodePtrWithHashMap<std::unordered_set<const ConstantNode *>> equal_funcs;
 
         /// Conjuncts already present in the AND, used to keep this optimization idempotent: a derived
-        /// transitive conjunct is appended only if an equal one is not already there.
+        /// transitive conjunct is appended only if an equal one is not already there. The identifier
+        /// resolve cache can hand the same node to several use sites, and the pass visitor is not
+        /// deduplicating, so a shared AND would otherwise accumulate the same derived conjunct once per
+        /// visit and desync from a singly-referenced copy (e.g. a GROUP BY key matched by formatted name).
         /// `indexHint(X)` is not interchangeable with plain `X`: a hint dedupes only hint-destined
         /// derivations, while contradictions and cross-source conjuncts must still materialize.
         /// A derived conjunct is `comparison(operand, constant)`, so conjuncts of that shape are indexed by operand and
@@ -2735,11 +2669,11 @@ private:
                                     insert_conjunct(existing_plain_conjuncts, left.node, and_node);
                                     function_node.getArguments().getNodes().push_back(and_node);
                                 }
-                                else if (!join_left_side_preserved && insert_conjunct(existing_hint_conjuncts, left.node, and_node))
+                                else if (preserved_join_tables.empty() && insert_conjunct(existing_hint_conjuncts, left.node, and_node))
                                 {
                                     /// Within one source it filters nothing beyond the original chain,
                                     /// so add it as `indexHint`: it still prunes, but does not execute.
-                                    /// Not if the join's left side is preserved: the join evaluates the input-less `indexHint` there.
+                                    /// Not in an outer join ON: the join evaluates the input-less `indexHint` with its left side.
                                     auto index_hint_node = std::make_shared<FunctionNode>("indexHint");
                                     index_hint_node->getArguments().getNodes().push_back(and_node);
                                     index_hint_node->resolveAsFunction(FunctionIndexHint::createImplied());
