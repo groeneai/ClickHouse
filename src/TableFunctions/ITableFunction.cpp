@@ -261,8 +261,8 @@ void ITableFunction::checkSourceAccessForURI(
     const auto source_name = toStringSource(source);
     auto [subject, escaped_subject] = getSourceAccessSubjects(source, uri);
     /// Globs expand after the check, so they must match as written and escaped: `.` in `report.csv` matches `*`, not its expansion.
-    if (subject != escaped_subject && !access->isGrantedWithFilter(flags, source_name, escaped_subject))
-        subject.clear();
+    if (subject != escaped_subject)
+        access->checkAccessWithFilter(flags, source_name, escaped_subject);
     access->checkAccessWithFilter(flags, source_name, subject);
 }
 
