@@ -38,6 +38,7 @@ public:
     void startup();
     void shutdown();
     bool triggerAndWait();
+    const std::string & getDiskName() const { return disk_name; }
     void applyNewSettings(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
 private:
@@ -58,8 +59,9 @@ private:
     /// Runtime statistics
     std::atomic<bool> started{false};
     std::atomic<bool> enabled{true};
+    std::atomic<int64_t> started_rounds{0};
     std::atomic<int64_t> finished_rounds{0};
-    std::atomic<int64_t> succeeded_rounds{0};
+    std::atomic<int64_t> last_succeeded_round{0};
 
     /// Runtime parameters
     std::atomic<int64_t> reschedule_interval_sec{0};

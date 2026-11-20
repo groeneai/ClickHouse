@@ -297,6 +297,7 @@ void BlobKillerThread::run()
 {
     auto component_guard = Coordination::setCurrentComponent("BlobKillerThread::run");
     LOG_TEST(log, "Starting cleanup");
+    const int64_t round = started_rounds.fetch_add(1) + 1;
 
     {
         /// The round is running, so the blobs queued from now on are seen either by it or by the next round,
@@ -313,8 +314,9 @@ void BlobKillerThread::run()
 
     remove_tasks_pool.setMaxThreads(round_threads_count);
     int64_t recorded_blobs = executeBlobsCleanup(round_request_batch, round_blobs_in_task, remove_tasks_runner, cluster, metadata_storage, object_storages, log);
-    succeeded_rounds.fetch_add(recorded_blobs > 0 || dead_queue_estimate == 0);
-    finished_rounds.fetch_add(1);
+    if (recorded_blobs > 0 || dead_queue_estimate == 0)
+        last_succeeded_round.store(round);
+    finished_rounds.store(round);
     finished_rounds.notify_all();
 
     {
@@ -392,8 +394,7 @@ int64_t BlobKillerThread::trigger()
     if (!started || !enabled)
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Blobs cleanup was not enabled for disk {}", disk_name);
 
-    int64_t current_round = finished_rounds.load();
-    int64_t expected_round = current_round + 1;
+    int64_t expected_round = started_rounds.load() + 1;
 
     task->schedule();
 
@@ -421,7 +422,6 @@ bool BlobKillerThread::triggerAndWait()
         return true;
     }
 
-    int64_t succeeded_before = succeeded_rounds.load();
     int64_t expected_round = trigger();
 
     bool wrapped_removed_blobs = true;
@@ -430,7 +430,7 @@ bool BlobKillerThread::triggerAndWait()
 
     waitRound(expected_round);
 
-    return wrapped_removed_blobs && succeeded_rounds.load() > succeeded_before;
+    return wrapped_removed_blobs && last_succeeded_round.load() >= expected_round;
 }
 
 void BlobKillerThread::applyNewSettings(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)

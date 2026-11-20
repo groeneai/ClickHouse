@@ -61,7 +61,7 @@ void DiskObjectStorageTransaction::waitBlobRemoval(const StoredObjects & blobs) 
         {
             if (!blob_killer->triggerAndWait())
             {
-                LOG_WARNING(getLogger("DiskObjectStorageTransaction"), "Blob removal made no progress, not waiting for it anymore");
+                LOG_WARNING(getLogger("DiskObjectStorageTransaction"), "Blob removal on disk {} made no progress, not waiting for it anymore", blob_killer->getDiskName());
                 break;
             }
         }
