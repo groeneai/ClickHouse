@@ -380,7 +380,7 @@ static size_t countConsumers(const ActionsDAG::Node * node, const ActionsDAGReve
     return res;
 }
 
-static UnorderedSetWithMemoryTracking<const ActionsDAG::Node *> processShortCircuitFunctions(
+static std::unordered_set<const ActionsDAG::Node *> processShortCircuitFunctions(
     const ActionsDAG & actions_dag,
     ShortCircuitFunctionEvaluation short_circuit_function_evaluation,
     bool reorder_arguments,

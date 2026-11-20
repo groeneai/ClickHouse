@@ -69,8 +69,8 @@ public:
         /// Lazily executed and used by several consumers: its result is reused within one `ColumnFunction` tree.
         bool is_shared_lazy_executed = false;
 
-        [[nodiscard]] std::string toString() const;
-        [[nodiscard]] JSONBuilder::ItemPtr toTree() const;
+        std::string toString() const;
+        JSONBuilder::ItemPtr toTree() const;
     };
 
     using Actions = std::vector<Action>;
